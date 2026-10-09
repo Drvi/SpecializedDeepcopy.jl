@@ -19,12 +19,17 @@ a, b = specialized_deepcopy((weights, weights))
 @assert a === b && a !== weights
 ```
 
+Call this one-argument method once for all related values. After the copy, it completes each copied
+`Dict` whose keys can change during the copy. The two-argument method below serves custom methods
+inside that call.
+
 Base copies raw pointer addresses unchanged. Here a raw pointer (`Ptr`, `Cstring`, `Cwstring` or
 `Core.LLVMPtr`) or `WeakRef` raises [`PointerCopyError`](@ref), unless an enclosing type's method
 handles ownership. The FunctionWrappers extension rebuilds the copied callable's object pointer.
 
-Non-pointer exceptions include rebuilding `IdSet` tables to avoid Base's member-lookup bug on
-Julia 1.11–1.13, resetting PreallocationTools workspaces, and the custom-method rules below.
+Non-pointer exceptions include rebuilding `IdSet` tables to avoid Base's member-lookup bug from
+Julia 1.11, refilling a copied `Dict` after the copy when the hash or the equality of its keys changed
+during the copy, resetting PreallocationTools workspaces, and the custom-method rules below.
 
     specialized_deepcopy(x, copies::IdDict{Any,Any})
 
@@ -55,7 +60,12 @@ SpecializedDeepcopy.specialized_deepcopy(x::LookupTable, copies) = x
 """
 function specialized_deepcopy end
 
-specialized_deepcopy(x) = _copy_value(x, IdDict{Any, Any}())::typeof(x)
+function specialized_deepcopy(x)
+    copies = IdDict{Any, Any}()
+    y = _copy_value(x, copies)::typeof(x)
+    _check_tables!(copies)
+    return y
+end
 specialized_deepcopy(x, copies) = _copy_by_fields(x, copies)
 
 # Generic copy paths bypass customization for pointer-free bits values.

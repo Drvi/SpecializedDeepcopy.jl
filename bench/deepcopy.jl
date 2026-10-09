@@ -47,6 +47,7 @@ const CASES = [
     "100 media" => [medium(i) for i in 1:100],
     "Dict of 1 000 vectors" => Dict("key$i" => rand(10) for i in 1:1000),
     "Symbol-keyed Dict" => Dict(Symbol("key$i") => rand(10) for i in 1:1000),
+    "Dict of 1 000 mutable keys" => Dict(Owner(i) => rand(10) for i in 1:1000),
     "1 000 immutable tables" => [Table(rand(11), rand(11), Ref(1), iseven(i) ? nothing : rand(11)) for i in 1:1000],
     "10 000 structs as Any" => Any[Owner(i) for i in 1:10_000],
     "list of 1 000 nodes" => linked_list(1000),
@@ -77,9 +78,11 @@ microseconds(t) = string(round(t * 1e6; digits = 2), " µs")
 # Sys.CPU_NAME is LLVM's target label, such as apple-m1 even on newer Apple chips.
 # cpu_info provides the processor model reported by the OS.
 println("Julia ", VERSION, " on ", Sys.cpu_info()[1].model)
-println(rpad("value", 24), column("deepcopy", 14), column("specialized", 14), column("speedup", 9), column("deepcopy", 12), column("specialized", 12))
+# The first column fits the longest case name.
+const NAME_WIDTH = maximum(length(name) for (name, _) in CASES) + 2
+println(rpad("value", NAME_WIDTH), column("deepcopy", 14), column("specialized", 14), column("speedup", 9), column("deepcopy", 12), column("specialized", 12))
 for (name, x) in CASES
     base, special = fastest(deepcopy, x), fastest(specialized_deepcopy, x)
-    println(rpad(name, 24), column(microseconds(base), 14), column(microseconds(special), 14), column(string(round(base / special; digits = 2), "x"), 9),
+    println(rpad(name, NAME_WIDTH), column(microseconds(base), 14), column(microseconds(special), 14), column(string(round(base / special; digits = 2), "x"), 9),
         column(string(allocated(deepcopy, x), " B"), 12), column(string(allocated(specialized_deepcopy, x), " B"), 12))
 end

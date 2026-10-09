@@ -104,24 +104,6 @@ BytesKey(bytes::Vector{UInt8}) = (KEY_BYTES[pointer(bytes)] = bytes; BytesKey(po
 SpecializedDeepcopy.specialized_deepcopy(x::BytesKey, copies) =
     get!(() -> BytesKey(copy(KEY_BYTES[x.address])), copies, x)::BytesKey
 
-# Duplicate C storage and give each owner its own finalizer.
-mutable struct OwnedBuffer
-    data::Ptr{UInt8}
-    length::Int
-    function OwnedBuffer(length::Int)
-        buffer = new(Ptr{UInt8}(Libc.malloc(length)), length)
-        finalizer(b -> Libc.free(b.data), buffer)
-        return buffer
-    end
-end
-function SpecializedDeepcopy.specialized_deepcopy(x::OwnedBuffer, copies)
-    haskey(copies, x) && return copies[x]::OwnedBuffer
-    y = OwnedBuffer(x.length)
-    GC.@preserve x y unsafe_copyto!(y.data, x.data, x.length)
-    copies[x] = y
-    return y
-end
-
 # Rebuild keys derived from object identity.
 struct OwnerIndex
     owners::Vector{Owner}
@@ -188,44 +170,13 @@ function SpecializedDeepcopy.specialized_deepcopy(x::RebuiltIdentityTable{K, V},
     return y
 end
 
-# Copying a key's own table hashes the unfinished key using the original owner.
-# OwnedKey copies the owner first, so insertion uses the final hash.
-mutable struct StaleHashKey
-    table::Dict{StaleHashKey, Int}
-    owner::Vector{Int}
-end
-Base.hash(k::StaleHashKey, h::UInt) = hash(objectid(k.owner), h)
-mutable struct OwnedKey
-    table::Dict{OwnedKey, Int}
-    owner::Vector{Int}
-end
-Base.hash(k::OwnedKey, h::UInt) = hash(objectid(k.owner), h)
-function SpecializedDeepcopy.specialized_deepcopy(x::OwnedKey, copies)
-    haskey(copies, x) && return copies[x]::OwnedKey
-    y = OwnedKey(Dict{OwnedKey, Int}(), specialized_deepcopy(x.owner, copies))
-    copies[x] = y
-    for (k, v) in x.table
-        y.table[specialized_deepcopy(k, copies)] = v
-    end
-    return y
-end
-
-# A shallow copy can retain a pointer after the original's finalizer frees its allocation.
-mutable struct MallocBuffer
-    data::Ptr{UInt8}
-    length::Int
-    function MallocBuffer(length::Int)
-        buffer = new(Ptr{UInt8}(Libc.malloc(length)), length)
-        finalizer(b -> Libc.free(b.data), buffer)
-        return buffer
-    end
-end
-
-# Duplicate the C string with strdup; each copy frees its own allocation.
+# Duplicate the C string, as strdup does; each copy frees its own allocation. Libc.malloc and
+# Libc.free use one C runtime on every platform, which a symbol lookup of strdup does not ensure.
 mutable struct CText
     text::Ptr{UInt8}
     function CText(text::Ptr{UInt8})
-        owned = new(ccall(:strdup, Ptr{UInt8}, (Ptr{UInt8},), text))
+        n = ccall(:strlen, Csize_t, (Ptr{UInt8},), text) + 1
+        owned = new(unsafe_copyto!(Ptr{UInt8}(Libc.malloc(n)), text, n))
         finalizer(t -> Libc.free(t.text), owned)
         return owned
     end
@@ -267,12 +218,6 @@ struct Logger
     level::Int
 end
 SpecializedDeepcopy.specialized_deepcopy(x::Logger, copies) = Logger(x.io, x.level)
-
-# Discard cached results instead of copying weak references.
-struct ResultCache
-    results::WeakKeyDict{Owner, Vector{Float64}}
-end
-SpecializedDeepcopy.specialized_deepcopy(x::ResultCache, copies) = ResultCache(WeakKeyDict{Owner, Vector{Float64}}())
 
 # A mutable type without fields: each copy is a new object.
 mutable struct Token end
@@ -429,18 +374,15 @@ mutable struct Gapped
     Gapped() = new()
 end
 
-# The same layouts as OwnerIndex, Logger and ResultCache, without a method.
+# The same layouts as OwnerIndex and Logger, without a method.
 struct StaleOwnerIndex
     owners::Vector{Owner}
     slots::Dict{UInt, Int}
 end
 StaleOwnerIndex(owners) = StaleOwnerIndex(owners, Dict(objectid(o) => i for (i, o) in pairs(owners)))
-struct PlainLogger
+struct LoggerWithoutMethod
     io::IOStream
     level::Int
-end
-struct PlainResultCache
-    results::WeakKeyDict{Owner, Vector{Float64}}
 end
 
 # Share C objects through an override on their owner, without pirating Vector's copy method.

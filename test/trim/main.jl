@@ -1,6 +1,12 @@
 # Trimmed runtime checks: print "ok" or "FAIL" for each, then "done".
 # Build identity-keyed tables at run time so their hashes match the loaded objects.
 include(joinpath(@__DIR__, "..", "types.jl"))
+# ExternBuffer, the README's example of a method that duplicates C memory.
+include(joinpath(@__DIR__, "..", "examples", "externally_allocated_memory.jl"))
+# CyclicKey, the README's example of a key whose hash changes after the copied table receives it.
+include(joinpath(@__DIR__, "..", "examples", "cyclic_key.jl"))
+# The dictionary keys of the fuzz fixtures.
+include(joinpath(@__DIR__, "..", "fuzz.jl"))
 
 report(name, ok::Bool) = println(Core.stdout, (ok ? "ok    " : "FAIL  ") * name)
 
@@ -58,7 +64,7 @@ function @main(ARGS)
     report("later copy is independent", specialized_deepcopy(buffer)[1] !== copied_owner)
 
     # Custom pointer copies and low-level field layouts.
-    c_buffer = OwnedBuffer(2)
+    c_buffer = ExternBuffer(2)
     unsafe_store!(c_buffer.data, 0x07)
     token = Token()
     later = AtomicLater()
@@ -84,6 +90,25 @@ function @main(ARGS)
         e isa PointerCopyError && e.type === Ptr{UInt} && e.field === nothing
     end
     report("raw pointer at the end of a self-nesting chain", chain_error)
+
+    # The check of rebuilt tables after the copy.
+    key = CyclicKey(Dict{CyclicKey, Int}(), [1])
+    key.table[key] = 1
+    copied_key = specialized_deepcopy(key)
+    report("key whose hash changes after its table receives it", only(keys(copied_key.table)) === copied_key && copied_key.table[copied_key] == 1)
+
+    # Fuzz fixture keys, made at run time: a copy method that changes tuple keys, keys that hash by
+    # identity, and a key that shares its owner with its value.
+    tagged = Dict((Fuzz.Tag(1), "a") => [1], (Fuzz.Tag(2), "b") => [2])
+    identity_keys = [Fuzz.IdentityKey(i) for i in 1:3]
+    ids = IdDict{Fuzz.IdentityKey, Int}(k => k.id for k in identity_keys)
+    owned = [7]
+    content = Dict(Fuzz.ContentKey(1, owned) => owned)
+    (copied_tagged, copied_identity_keys, copied_ids, copied_content) = specialized_deepcopy((tagged, identity_keys, ids, content))
+    report("tuple keys that their copy method changes", all(k -> startswith(k[2], "c") && haskey(copied_tagged, k), keys(copied_tagged)))
+    report("keys that hash by identity", all(k -> copied_ids[k] == k.id, copied_identity_keys) && !any(k -> haskey(copied_ids, k), identity_keys))
+    content_key, content_value = only(copied_content)
+    report("key that shares its owner with its value", content_key.owner === content_value !== owned && copied_content[content_key] === content_value)
     println(Core.stdout, "done")
     return 0
 end

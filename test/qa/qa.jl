@@ -4,6 +4,8 @@
 using SpecializedDeepcopy
 using FunctionWrappers: FunctionWrapper
 using PreallocationTools: DiffCache
+using SharedArrays: SharedArray
+using SparseArrays: SparseArrays
 using Test
 import Aqua, JET
 
@@ -15,4 +17,12 @@ import Aqua, JET
     JET.test_call(specialized_deepcopy, (FunctionWrapper{Int, Tuple{Int}}, IdDict{Any, Any}); target_modules = (extension,))
     extension = Base.get_extension(SpecializedDeepcopy, :SpecializedDeepcopyPreallocationToolsExt)
     JET.test_call(specialized_deepcopy, (DiffCache{Vector{Float64}, Vector{Float64}}, IdDict{Any, Any}); target_modules = (extension,))
+    extension = Base.get_extension(SpecializedDeepcopy, :SpecializedDeepcopySharedArraysExt)
+    JET.test_call(specialized_deepcopy, (SharedArray{Float64, 1}, IdDict{Any, Any}); target_modules = (extension,))
+    # The SparseArrays extension has a method only where SparseArrays defines CholmodWS.
+    extension = Base.get_extension(SpecializedDeepcopy, :SpecializedDeepcopySparseArraysExt)
+    @test extension !== nothing
+    @static if isdefined(SparseArrays.CHOLMOD, :CholmodWS)
+        JET.test_call(specialized_deepcopy, (SparseArrays.CHOLMOD.CholmodWS{Int}, IdDict{Any, Any}); target_modules = (extension,))
+    end
 end

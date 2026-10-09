@@ -7,6 +7,15 @@ const BaseCopied = Union{
 
 specialized_deepcopy(x::BaseCopied, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
 
+# From Julia 1.14, Base shares cancellation token sources and gives a wait entry, which has storage
+# beyond its fields, a new entry from the runtime. A field copy of a wait entry would lack that storage.
+@static if isdefined(Core, :CancellationTokenSource)
+    specialized_deepcopy(x::Core.CancellationTokenSource, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
+end
+@static if isdefined(Core, :WaitEntryN)
+    specialized_deepcopy(x::Core.WaitEntryN, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
+end
+
 # Reset the wait queue and copy the lock. get! preserves a condition copy registered by a cycle
 # through the lock, keeping repeated conditions on one copied queue.
 function specialized_deepcopy(x::Base.GenericCondition, copies)
@@ -28,14 +37,16 @@ end
 # Field reconstruction would bypass the garbage collector's WeakRef registration.
 specialized_deepcopy(::WeakRef, copies) = throw(PointerCopyError(WeakRef, nothing))
 
-# A key of one of these types hashes by value, so its copy lands in the same slot and the table's
-# slots are copied with the entries, as Base.deepcopy does. A mutable key hashes by identity, and
-# so does an IdDict key, so those tables are rebuilt by reinserting copied keys. So is a table whose
-# keys can hold a raw pointer: the method of such a key can give its copy another pointer.
+# The copy of a plain, String or Symbol key is equal to the key and hashes the same: a plain value
+# bypasses custom methods, and a method for String or Symbol would be type piracy. So a Dict with
+# such keys keeps its slots, and the copy replaces its keys and values in place. Base.deepcopy
+# reinserts the entries unless the keys and values are bits types. Other keys can hash differently
+# in the copy: a key can hash by identity or by its fields, a method can change a tuple that holds
+# a type of its own, and a method can give a raw pointer another address. Those tables, and
+# IdDicts, are rebuilt by reinserting the copied keys.
 function _stable_hash(@nospecialize(K))
     (_is_plain(K) || K === String || K === Symbol) && return true
-    K isa Union && return all(_stable_hash, Base.uniontypes(K))
-    return isconcretetype(K) && (K <: Tuple || K <: NamedTuple) && all(_stable_hash, fieldtypes(K))
+    return K isa Union && all(_stable_hash, Base.uniontypes(K))
 end
 @generated _stable(::Type{K}) where {K} = _stable_hash(K)
 
@@ -53,7 +64,82 @@ function specialized_deepcopy(x::D, copies) where {D <: Union{Dict, IdDict}}
     end
     y = empty(x)
     copies[x] = y
-    return _copy_entries!(y, x, copies)
+    if D <: Dict && !_settled(keytype(D))
+        entries = sizehint!(Pair{keytype(D), valtype(D)}[], length(x))
+        _copy_entries!(y, x, copies, entries)
+        _check_later!(copies, y, entries)
+    else
+        _copy_entries!(y, x, copies, nothing)
+    end
+    return y
+end
+
+# A key that refers back to its table, directly or through other objects, enters the copied table
+# before the copy has set all fields of the key and of the objects between them. Until then, its hash
+# and its equality can read placeholders, so the key can land in a wrong slot, and two keys can compare
+# equal for a moment, so that one entry replaces the other. So a Dict whose keys can change (see
+# _settled_key) keeps its copied entries, and the top-level call refills the table from them after the
+# copy has set every field, unless the table holds exactly those entries. A C function pointer for
+# each table type keeps the list of tables free of runtime dispatch.
+# The list is in `copies` under a mutable key: an IdDict hashes it by its address, which costs less
+# in each top-level call than the hash of a singleton instance.
+mutable struct _RebuiltTables end
+const _REBUILT_TABLES = _RebuiltTables()
+
+# A plain, String or Symbol key, or an immutable key whose fields have such types, is complete when
+# the copied table receives it, and no mutable object is reachable from it. So its hash and its
+# equality cannot change after the insertion, and its table needs no check. A type that refers to itself through a Union
+# field adds no other type.
+function _settled_key(@nospecialize(K), seen = Any[])
+    (_is_plain(K) || K === String || K === Symbol) && return true
+    any(T -> T === K, seen) && return true
+    push!(seen, K)
+    K isa Union && return all(T -> _settled_key(T, seen), Base.uniontypes(K))
+    return isconcretetype(K) && !ismutabletype(K) && all(T -> _settled_key(T, seen), fieldtypes(K))
+end
+@generated _settled(::Type{K}) where {K} = _settled_key(K)
+
+# An IdDict finds a key by its identity, which does not change during the copy.
+_check_later!(copies, ::IdDict, entries) = nothing
+function _check_later!(copies, table::D, entries) where {D <: Dict}
+    tables = get!(Vector{Tuple{Ptr{Cvoid}, Any, Any}}, copies, _REBUILT_TABLES)::Vector{Tuple{Ptr{Cvoid}, Any, Any}}
+    push!(tables, (_check_table_function_pointer(D), table, entries))
+    return nothing
+end
+
+# Refill the table from its copied entries unless it holds exactly them: as many entries, each key
+# found with its own value. Return whether it refilled the table.
+function _check_table!(table::Dict, entries)
+    length(table) == length(entries) && all(((k, v),) -> haskey(table, k) && table[k] === v, entries) && return false
+    empty!(table)
+    for (k, v) in entries
+        table[k] = v
+    end
+    return true
+end
+
+# Defined after _check_table!: the generated @cfunction needs its binding, also when the package loads
+# without compiled modules.
+@generated function _check_table_function_pointer(::Type{D}) where {D}
+    return :(@cfunction(_check_table!, Bool, (Ref{$D}, Ref{Vector{Pair{$(keytype(D)), $(valtype(D))}}})))
+end
+
+# A refilled table can change the keys of another table whose hash or equality reads it, so the passes
+# repeat until none refills a table. Tables that do not settle within one pass per table, or two
+# copied keys of one table that are equal, raise an error instead of losing an entry.
+function _check_tables!(copies)
+    tables = get(copies, _REBUILT_TABLES, nothing)
+    tables === nothing && return nothing
+    list = tables::Vector{Tuple{Ptr{Cvoid}, Any, Any}}
+    for _ in 0:length(list)
+        refilled = false
+        for (function_pointer, table, entries) in list
+            refilled |= ccall(function_pointer, Bool, (Any, Any), table, entries)
+        end
+        refilled || return nothing
+    end
+    throw(ArgumentError("a copied Dict cannot hold its copied entries: two of its keys are equal, or " *
+        "refilling it changes the keys of another copied Dict"))
 end
 
 # Replace the keys and values of the filled slots in place; Base.isslotfilled reads the slot byte.
@@ -73,33 +159,41 @@ end
 end
 
 # Generate these loops so _copy_expr can split declared key, value and element types, as for fields.
-@generated function _copy_entries!(y, x, copies)
+# A vector `entries` also keeps each copied pair.
+@generated function _copy_entries!(y, x, copies, entries)
     copy_key = _copy_expr(:k, keytype(x))
     copy_value = _copy_expr(:v, valtype(x))
+    keep = entries === Nothing ? nothing : :(push!(entries, key => value))
     return quote
         for (k, v) in x
-            y[$copy_key::typeof(k)] = $copy_value::typeof(v)
+            key, value = $copy_key::typeof(k), $copy_value::typeof(v)
+            y[key] = value
+            $keep
         end
         return y
     end
 end
 
-# On Julia 1.11–1.13, Base copies IdSet's members but retains their old identity-based index.
-# Reinserting the copied members rebuilds that index so lookups work.
-function specialized_deepcopy(x::S, copies) where {S <: Base.IdSet}
-    haskey(copies, x) && return copies[x]::S
-    y = S()
-    copies[x] = y
-    return _copy_members!(y, x, copies)
-end
+# From Julia 1.11, an IdSet indexes its members by identity in fields of its own, and Base copies
+# that index unchanged, so the copied set does not find its copied members. Reinserting them
+# rebuilds the index. Before 1.11, an IdSet wraps an IdDict, which the generic field copy rebuilds
+# while keeping aliases to it, as Base does.
+@static if !hasfield(Base.IdSet{Any}, :dict)
+    function specialized_deepcopy(x::S, copies) where {S <: Base.IdSet}
+        haskey(copies, x) && return copies[x]::S
+        y = S()
+        copies[x] = y
+        return _copy_members!(y, x, copies)
+    end
 
-@generated function _copy_members!(y, x, copies)
-    copy = _copy_expr(:k, eltype(x))
-    return quote
-        for k in x
-            push!(y, $copy::typeof(k))
+    @generated function _copy_members!(y, x, copies)
+        copy = _copy_expr(:k, eltype(x))
+        return quote
+            for k in x
+                push!(y, $copy::typeof(k))
+            end
+            return y
         end
-        return y
     end
 end
 

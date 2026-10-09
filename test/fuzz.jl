@@ -1,5 +1,7 @@
-# Generate struct layouts and graphs, then check their copies. Base.deepcopy gets the copy methods of
-# the fixtures, so that it is an oracle for every family; the method family exercises the overrides.
+# Generate struct layouts and graphs, then check their copies for types, values, undefined fields,
+# aliases, cycles and mutable isolation, including shared array storage. Base.deepcopy gets the copy
+# methods of the fixtures, so that it is an oracle for every family; the method family exercises the
+# overrides. test/fuzz_cases.jl adds explicit shapes, and scripts/fuzz_hammer.jl runs both for longer.
 module Fuzz
 
 using FunctionWrappers: FunctionWrapper
@@ -60,12 +62,65 @@ end
 bumped(x::Bumped) = Bumped(x.value === nothing ? nothing : x.value + 1)
 SpecializedDeepcopy.specialized_deepcopy(x::Bumped, copies) = bumped(x)
 
+# Dictionary keys with an ID that the copy keeps, so that the checker can pair the entries of a table
+# and its copy without the original keys. The keys of one generated value have distinct IDs.
+struct Tag
+    id::Int
+end
+# Tuple keys whose copy method changes the String, so that the copied table must reinsert them.
+const TaggedKey = Tuple{Tag, String}
+const NamedKey = @NamedTuple{tag::Tag, name::String}
+retag(k::TaggedKey) = (k[1], "c" * k[2])
+retag(k::NamedKey) = (tag = k.tag, name = "c" * k.name)
+SpecializedDeepcopy.specialized_deepcopy(k::Union{TaggedKey, NamedKey}, copies) = retag(k)
+# A key that hashes by identity.
+mutable struct IdentityKey
+    const id::Int
+end
+# A key that hashes by its contents. A change of its owner after insertion would make the original
+# table stale, so the generator keeps owners away from rewiring.
+mutable struct ContentKey
+    const id::Int
+    owner::Vector{Int}
+end
+Base.hash(k::ContentKey, h::UInt) = hash(k.owner, hash(k.id, h))
+Base.isequal(a::ContentKey, b::ContentKey) = a.id == b.id && isequal(a.owner, b.owner)
+Base.:(==)(a::ContentKey, b::ContentKey) = isequal(a, b)
+# A key whose hash reads the identity of a field, in a table that the key refers to. The copied table
+# receives the key before the copy sets that field. Base.deepcopy reads the unset field and crashes,
+# so only the explicit cases of test/fuzz_cases.jl use this key, without Base.deepcopy.
+mutable struct LoopKey
+    const id::Int
+    table::Dict{LoopKey, Int}
+    owner::Vector{Int}
+end
+Base.hash(k::LoopKey, h::UInt) = hash(objectid(k.owner), hash(k.id, h))
+# A key whose hash and equality read whether two of its fields are one object, in a table that the key
+# refers to. While the copy sets those fields, two keys can compare equal for a moment. Like LoopKey,
+# only the explicit cases use this key, without Base.deepcopy.
+mutable struct AliasKey
+    const id::Int
+    left::Vector{Int}
+    table::Dict{AliasKey, Int}
+    right::Vector{Int}
+end
+aliased(k::AliasKey) = k.left === k.right
+Base.hash(k::AliasKey, h::UInt) = hash(aliased(k), h)
+Base.isequal(a::AliasKey, b::AliasKey) = aliased(a) == aliased(b)
+Base.:(==)(a::AliasKey, b::AliasKey) = isequal(a, b)
+const FixtureKey = Union{TaggedKey, NamedKey, IdentityKey, ContentKey, LoopKey, AliasKey}
+key_id(k) = k
+key_id(k::TaggedKey) = (:tagged, k[1].id)
+key_id(k::NamedKey) = (:named, k.tag.id)
+key_id(k::Union{IdentityKey, ContentKey, LoopKey, AliasKey}) = (nameof(typeof(k)), k.id)
+
 # Give Base.deepcopy matching fixture overrides. The FunctionWrapper method is test-only piracy;
 # it always defers both pointers, using FunctionWrappers' initialization for precompiled wrappers.
 Base.deepcopy_internal(x::Shared, ::IdDict) = x
 Base.deepcopy_internal(x::Rebuilt{T}, d::IdDict) where {T} = Rebuilt{T}(Base.deepcopy_internal(x.inner, d))
 Base.deepcopy_internal(x::FuzzLock, ::IdDict) = x
 Base.deepcopy_internal(x::Bumped, ::IdDict) = bumped(x)
+Base.deepcopy_internal(k::Union{TaggedKey, NamedKey}, ::IdDict) = retag(k)
 function Base.deepcopy_internal(x::FunctionWrapper{R, A}, d::IdDict) where {R, A}
     haskey(d, x) && return d[x]::FunctionWrapper{R, A}
     # The pointer fields of the new struct are null.
@@ -79,6 +134,11 @@ end
 const SCALARS = Any[Int, Int8, UInt64, Float64, Float32, Bool, UInt8, Char, Symbol, String, Nothing, Missing]
 const REGEXES = [r"a+", r"b*c", r"\d"]
 const KEYS = Any[Int, String, Symbol]
+# Trim families keep the scalar keys: a stored table with identity keys would need hashes from after
+# the build, and their fixed seeds guard known compiler limits.
+const ID_KEYS = Any[KEYS; IdentityKey; ContentKey]
+const METHOD_KEYS = Any[ID_KEYS; TaggedKey; NamedKey; Union{Nothing, TaggedKey}]
+key_types(trim, methods) = trim ? KEYS : methods ? METHOD_KEYS : ID_KEYS
 const NAMES = [:red, :green, :blue]
 const DEFINED = Ref(0)
 
@@ -96,14 +156,14 @@ function random_type(rng, family, self, depth; trim, methods)
     # A Union with a raw pointer member, which no value holds, must copy like one without it.
     choice == 1 && return rand(rng, Bool) ? :(Union{Nothing, $self}) : :(Union{Nothing, Ptr{UInt}, $self})
     choice == 2 && return :(Vector{$self})
-    choice == 3 && return :(Dict{$(rand(rng, KEYS)), $self})
+    choice == 3 && return :(Dict{$(rand(rng, key_types(trim, methods))), $self})
     choice == 4 && return optional(Nothing)
     choice == 5 && return optional(Missing)
     choice == 6 && return :(Union{$(leaf()), $(leaf())})
     choice == 7 && return :(Vector{$(inner())})
     choice == 8 && return :(Matrix{$(inner())})
-    choice == 9 && return :(Dict{$(rand(rng, KEYS)), $(inner())})
-    choice == 10 && return :(IdDict{$(rand(rng, KEYS)), $(inner())})
+    choice == 9 && return :(Dict{$(rand(rng, key_types(trim, methods))), $(inner())})
+    choice == 10 && return :(IdDict{$(rand(rng, key_types(trim, methods))), $(inner())})
     # Concrete tuple elements keep trim cases within the union-expansion limit.
     choice == 11 && return trim ? :(Tuple{$(leaf()), $(leaf())}) : :(Tuple{$(inner()), $(inner())})
     choice == 12 && return :(NamedTuple{(:a, :b), Tuple{$(inner()), $(inner())}})
@@ -176,6 +236,7 @@ mutable struct Env
     family::Vector{DataType}
     pool::Vector{Any}  # candidates for aliases and cycles
     width::Int         # sampled container lengths, column counts and entry counts
+    ids::Int           # the last ID given to a fixture key
 end
 
 """
@@ -187,7 +248,7 @@ May prepend pooled objects, including wrapper state, to vary traversal order.
 rewiring mean neither is a strict bound on the final graph.
 """
 function generate(rng, family; depth = 3, width = 3)
-    env = Env(rng, family, Any[], width)
+    env = Env(rng, family, Any[], width, 0)
     roots = Any[value(env, rand(rng, family), depth) for _ in 1:rand(rng, 1:3)]
     rewire!(env, rand(rng, 0:(width + 1)))
     first_roots = Any[]
@@ -204,7 +265,7 @@ function value(env, @nospecialize(F), depth)
         # No value holds a raw pointer, whose copy raises PointerCopyError.
         members = filter(m -> !(m <: Ptr), Base.uniontypes(F))
         if depth <= 0
-            terminal = filter(m -> isbitstype(m) || m === String, members)
+            terminal = filter(m -> isbitstype(m) || m === String || m <: FixtureKey, members)
             isempty(terminal) || (members = terminal)
         end
         return value(env, rand(rng, members), depth)
@@ -236,6 +297,18 @@ function value(env, @nospecialize(F), depth)
         return x
     elseif F === Bumped
         return Bumped(rand(rng, Bool) ? nothing : rand(rng, Int))
+    elseif F === IdentityKey
+        # Rewiring can make other objects refer to the key; its only field is const.
+        x = IdentityKey(env.ids += 1)
+        push!(env.pool, x)
+        return x
+    elseif F === ContentKey
+        # Neither the key nor its owner joins the pool, so rewiring cannot change the key's hash.
+        return ContentKey(env.ids += 1, rand(rng, Int, rand(rng, 0:2)))
+    elseif F === TaggedKey
+        return (Tag(env.ids += 1), String(rand(rng, 'a':'z', rand(rng, 0:3))))
+    elseif F === NamedKey
+        return (tag = Tag(env.ids += 1), name = String(rand(rng, 'a':'z', rand(rng, 0:3))))
     elseif F === Regex
         return rand(rng, REGEXES)
     elseif F === Core.Box
@@ -409,7 +482,8 @@ struct Mismatch <: Exception
     message::String
 end
 
-fail(path, what) = throw(Mismatch(string(isempty(path) ? "at the root" : "at " * join(path, "."), ": ", what)))
+where_(path) = isempty(path) ? "at the root" : "at " * join(path, ".")
+fail(path, what) = throw(Mismatch(string(where_(path), ": ", what)))
 
 # Types whose values are shared between a value and its copy.
 shared_by_design(x) = x isa Symbol || x isa Type || x isa Module || x isa Regex || x isa Shared || x isa FuzzLock
@@ -445,6 +519,11 @@ tracked by identity; `shared_by_design` values may remain shared. A `Bumped` val
 copy method ran, except in a field that `y` copies by its bits (see `bits_field`): set `bits_fields` to
 false for a copy from Base.deepcopy, which has no such fields. Uninitialized inline bits can cause
 mismatches, so `generate` initializes them.
+
+A table or set with fixture keys (see `key_id`) is compared by pairing its entries by key ID, so its
+keys are compared like its values, also when a copy method changes them. Each key of a copied `Dict`
+or `IdDict`, and each member of a copied `IdSet`, must find its own entry. Two keys with one ID in an
+original table raise an error, because the checker cannot pair them.
 """
 function check(x, y; bits_fields = true)
     forward, backward = IdDict{Any, Any}(), IdDict{Any, Any}()
@@ -460,7 +539,47 @@ function check(x, y; bits_fields = true)
     return nothing
 end
 
-function compare(x, y, forward, backward, path, bits_fields)
+# Pair the entries of a table, or the members of a set, by key ID. Then compare both keys and values
+# through the identity maps, which find split and merged aliases. `entries` gives (key, value) pairs.
+function compare_paired(@nospecialize(x), @nospecialize(y), entries, forward, backward, path, bits_fields)
+    ids = Set{Any}()
+    for (k, _) in entries(x)
+        id = key_id(k)
+        id in ids && error(where_(path), ": two keys of the original have the ID ", repr(id))
+        push!(ids, id)
+    end
+    copied = Dict{Any, Any}()
+    for (k, v) in entries(y)
+        id = key_id(k)
+        haskey(copied, id) && fail(path, "two keys of the copy have the ID $(repr(id))")
+        copied[id] = (k, v)
+    end
+    for (k, v) in entries(x)
+        id = key_id(k)
+        entry = get(copied, id, nothing)
+        entry === nothing && fail(path, "the key with ID $(repr(id)) is missing")
+        compare(k, entry[1], forward, backward, [path; :key; id], bits_fields)
+        compare(v, entry[2], forward, backward, [path; id], bits_fields)
+    end
+end
+
+# Each key of a copied hash table finds its own entry; a key in a stale slot does not.
+function check_lookups(@nospecialize(y), path)
+    if y isa Union{Dict, IdDict}
+        for (k, v) in y
+            haskey(y, k) && y[k] === v || fail(path, "the copied key $(summary(k)) with ID $(repr(key_id(k))) does not find its entry")
+        end
+    elseif y isa Base.IdSet
+        for member in y
+            member in y || fail(path, "the copied member $(summary(member)) is not found")
+        end
+    end
+end
+
+# The functions of the checker do not specialize on the values. The generated types are new in each
+# round, and compiling specializations for them took more than half of the time of a check (300 seeds
+# on Julia 1.12).
+function compare(@nospecialize(x), @nospecialize(y), forward, backward, path, bits_fields)
     typeof(x) === typeof(y) || fail(path, "type $(typeof(x)) became $(typeof(y))")
     if isbits(x) || shared_by_design(x)
         x === y || fail(path, "$(repr(x)) became $(repr(y))")
@@ -472,6 +591,10 @@ function compare(x, y, forward, backward, path, bits_fields)
     end
     if x isa Bumped
         y === bumped(x) || fail(path, "the copy method of Bumped did not run: $(repr(x)) became $(repr(y))")
+        return
+    end
+    if x isa Union{TaggedKey, NamedKey}
+        isequal(y, retag(x)) || fail(path, "the copy method of the tuple key did not run: $(repr(x)) became $(repr(y))")
         return
     end
     if x isa Union{BigInt, BigFloat}
@@ -504,17 +627,28 @@ function compare(x, y, forward, backward, path, bits_fields)
         end
     elseif x isa AbstractDict
         length(x) == length(y) || fail(path, "length $(length(x)) became $(length(y))")
-        for (k, v) in x
-            haskey(y, k) || fail(path, "the key $(repr(k)) is missing")
-            compare(v, y[k], forward, backward, [path; k], bits_fields)
+        if any(k -> k isa FixtureKey, keys(x))
+            compare_paired(x, y, pairs, forward, backward, path, bits_fields)
+        else
+            # A scalar key is its own copy.
+            for (k, v) in x
+                haskey(y, k) || fail(path, "the key $(repr(k)) is missing")
+                compare(v, y[k], forward, backward, [path; k], bits_fields)
+            end
         end
+        check_lookups(y, path)
     elseif x isa AbstractSet && table(x) !== nothing
         compare(table(x), table(y), forward, backward, [path; :dict], bits_fields)
     elseif x isa AbstractSet
         length(x) == length(y) || fail(path, "length $(length(x)) became $(length(y))")
-        for member in x
-            member in y || fail(path, "the member $(repr(member)) is missing")
+        if any(m -> m isa FixtureKey, x)
+            compare_paired(x, y, set -> ((m, nothing) for m in set), forward, backward, path, bits_fields)
+        else
+            for member in x
+                member in y || fail(path, "the member $(repr(member)) is missing")
+            end
         end
+        check_lookups(y, path)
     elseif x isa FunctionWrapper
         getfield(x, :objT) === getfield(y, :objT) || fail(path, "the wrapped type changed")
         compare(getfield(x, :obj), getfield(y, :obj), forward, backward, [path; :obj], bits_fields)
@@ -543,7 +677,7 @@ function compare(x, y, forward, backward, path, bits_fields)
 end
 
 # Enforce a one-to-one mapping of mutable objects; return true for a consistent repeat visit.
-function seen!(x, y, forward, backward, path)
+function seen!(@nospecialize(x), @nospecialize(y), forward, backward, path)
     if haskey(forward, x)
         forward[x] === y || fail(path, "an object that the original shares is not shared by the copy")
         return true
@@ -562,7 +696,7 @@ function mutables(x)
     return set
 end
 
-function collect_mutables!(set, x)
+function collect_mutables!(set, @nospecialize(x))
     (isbits(x) || shared_by_design(x) || x isa String) && return
     if x isa Union{BigInt, BigFloat}
         # Track the number as an object without reading its C representation.

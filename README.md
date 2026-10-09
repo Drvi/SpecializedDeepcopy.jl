@@ -1,8 +1,8 @@
 # SpecializedDeepcopy
 
-`specialized_deepcopy(x)` generates copy code for concrete types so suitable object graphs can be copied in programs built with `juliac --trim=safe`. `Base.deepcopy` uses runtime dispatch that the trim verifier rejects.
+`specialized_deepcopy(x)` generates copy code for concrete types so suitable object graphs can be copied in programs built with `juliac --trim=safe`. `Base.deepcopy` uses runtime dispatch that the trim verifier rejects. Because `specialized_deepcopy` specializes on every type, expect longer compile times and larger code than with `Base.deepcopy`.
 
-The target contract is **`Base.deepcopy` with stricter pointer handling**: preserve types, values, aliases and cycles, with an explicit ownership policy for pointer-backed state. The current implementation also has the non-pointer differences listed below.
+The target contract is **`Base.deepcopy` with stricter pointer handling**: preserve types, values, aliases and cycles, with an explicit ownership policy for pointer-backed state. The current implementation has the non-pointer differences listed below.
 
 Supports Julia 1.10–1.13. Trim tests require Julia 1.12 or later.
 
@@ -25,6 +25,8 @@ inputs, outputs = specialized_deepcopy((weights, weights))
 @assert inputs === outputs && inputs !== weights
 ```
 
+Call `specialized_deepcopy` with one argument. After the copy, it completes the copied dictionaries whose keys can change during the copy; see [Different from Base.deepcopy](#different-from-basedeepcopy). The two-argument method is for [custom copy methods](#custom-copy-methods), which run inside that call.
+
 Do not mutate the input graph during copying.
 
 ## Differences from Base.deepcopy
@@ -36,13 +38,16 @@ Do not mutate the input graph during copying.
 | `WeakKeyDict` | Rebuilds the table with copied keys | Throws `PointerCopyError`, because the table holds its keys as `WeakRef`s |
 | `FunctionWrapper` | Retains the original object pointer | The extension copies the callable storage and rebuilds the pointer |
 | `DiffCache` / `FixedSizeDiffCache` workspaces | Copies existing workspaces | The extension starts with empty workspace containers |
-| `IdSet` | Field copying can break member lookups on Julia 1.11–1.13 | Rebuilds the set |
-| Custom `Base.deepcopy_internal` method | Calls that method | Requires a separate `specialized_deepcopy` method |
+| `IdSet` | From Julia 1.11, the copied set does not find most of its members | From Julia 1.11, rebuilds the set, so lookups work |
 | Optional non-isbits inline field described below | Calls the value's copy method | Copies its bits without a method call |
 
-Copying pointer bits neither copies nor keeps the target alive. A custom method must decide whether to share or duplicate the resource. A union such as `Union{Nothing, Ptr{Cvoid}}` is rejected only when it holds a pointer. A `WeakKeyDict` needs a method on the type that holds it, for example one that starts an empty table, as `ResultCache` in [test/types.jl](test/types.jl) does.
+The `IdSet` and `FunctionWrapper` rows fix defects of `Base.deepcopy`. From Julia 1.11, `Base.deepcopy` keeps the stale objectids of the original members in the index of the copied `IdSet`. With a `FunctionWrapper`, `Base.deepcopy` does not deep-copy a stateful callable properly: calls on the copy still use the state of the original.
+
+Copying pointer bits neither copies nor keeps the target alive. A custom method must decide whether to share or duplicate the resource. A union such as `Union{Nothing, Ptr{Cvoid}}` is rejected only when it holds a pointer. A `WeakKeyDict` needs a method on the type that holds it, for example one that starts an empty table, as [test/examples/result_cache.jl](test/examples/result_cache.jl) shows.
 
 The last row applies to fields that a constructor can leave unset, with a concrete, immutable, inline type containing no references or raw pointers. It applies **even when the field is initialized**. Unset bits can contain invalid Union tags, and there is no definedness flag to distinguish them. For a non-plain type `T`, declaring the field as `Union{T, Nothing}` allows its custom method to run.
+
+`specialized_deepcopy` does not call custom `Base.deepcopy_internal` methods of other packages. A type with such a method needs a (two-argument) `specialized_deepcopy` method too. [Custom copy methods](#custom-copy-methods) describes how to write one.
 
 ## Behavior shared with Base.deepcopy
 
@@ -53,9 +58,9 @@ A **plain value** is an `isbitstype` value containing no raw pointer. It is retu
 Special handling covers:
 
 - `Array`, `Memory`, `MemoryRef`: new storage. On Julia 1.11+, shared array storage stays shared within the copy. Julia 1.10 copies each array separately, as Base does.
-- `Dict` whose keys hash by value (plain values, `String`, `Symbol`, and tuples, named tuples and unions of these): the slots are copied with the entries, as Base does. A key that holds a raw pointer is not in this group, because its method can give the copy another pointer. Other `Dict`s and `IdDict`: rebuilt tables for copied keys. Keys whose hashes read unfinished copies need special handling; see the limits below.
+- `Dict` with plain, `String` or `Symbol` keys, or a union of these: the copy keeps the slots and replaces the keys and values, because the copy of such a key hashes the same. Other `Dict`s and `IdDict`: rebuilt tables with the copied keys. For a key whose hash changes during the copy, see [Different from Base.deepcopy](#different-from-basedeepcopy).
 - `Core.SimpleVector`: copied elements.
-- Strings, big numbers and locks: Base's copy methods. Conditions get a copied lock and an empty wait queue.
+- Strings, big numbers and locks: the methods of `Base.deepcopy`. Conditions get a copied lock and an empty wait queue.
 - Symbols, types, tasks, regular expressions, methods, method instances and `GlobalRef`: shared with the original.
 - Modules: rejected, as by Base.
 
@@ -65,7 +70,7 @@ Other identity-based collections may need a method that reinserts copied keys.
 
 Define `SpecializedDeepcopy.specialized_deepcopy(x::YourType, copies)`. The `copies::IdDict{Any,Any}` argument maps originals to copies, some still under construction.
 
-Custom `Base.deepcopy_internal` methods must be ported to this API. This also applies to standard libraries: a field-copied `SharedArray` can leave worker processes writing into the original's shared memory. For pointers in Base containers, such as `Vector{Ptr{Cvoid}}`, define the method on your enclosing type.
+Custom `Base.deepcopy_internal` methods of other packages must be ported to this API. Base and the standard libraries need no port: for each of their types with such a method, the package has a method of its own or calls Base's method. For pointers in Base containers, such as `Vector{Ptr{Cvoid}}`, define the method on your enclosing type.
 
 1. Return the same type as `x`.
 2. Use `specialized_deepcopy(value, copies)` for nested values.
@@ -103,11 +108,11 @@ function SpecializedDeepcopy.specialized_deepcopy(x::OwnerIndex, copies)
 end
 ```
 
-For owned C memory, see `OwnedBuffer` in [test/types.jl](test/types.jl). Its method allocates independent storage, preserves both owners while copying bytes, and installs a finalizer.
+For externally allocated memory, see `ExternBuffer` in [test/examples/externally_allocated_memory.jl](test/examples/externally_allocated_memory.jl). Its method allocates independent storage, preserves both owners while copying bytes, and installs a finalizer.
 
 ### FunctionWrappers
 
-Loading FunctionWrappers.jl enables copying of callable storage and reconstruction of the wrapper's object pointer. The extension requires FunctionWrappers 1.1.2 or later. Earlier versions cannot call any wrapper on Julia 1.10 or later, so the compat entry of the package excludes them.
+Loading FunctionWrappers.jl enables copying of callable storage and reconstruction of the wrapper's object pointer. [test/examples/wrapped_mutable_callable.jl](test/examples/wrapped_mutable_callable.jl) shows a callable with state: calls on the copy that `Base.deepcopy` makes change the original, and calls on the copy that this package makes do not. The extension requires FunctionWrappers 1.1.2 or later. Earlier versions cannot call any wrapper on Julia 1.10 or later, so the compat entry of the package excludes them.
 
 Standard `Base.RefValue` roots usually get their object pointer during copying. Custom conversion roots or methods, and cycles through unfinished boxed callables, defer initialization until the first call. Make that call before concurrent use: lazy initialization is not synchronized. Wrapper copying requires runtime dispatch and is **not trim-safe**.
 
@@ -118,6 +123,12 @@ Loading PreallocationTools.jl enables an extension for `DiffCache` and `FixedSiz
 Each container gets one copy, so caches that share a container, such as a cache and its `reshape`, also share it in the copy. If the copy reaches a container through another reference before it reaches a cache that holds it, the cache gets that copy, with its entries. The extension copies all other fields as the generic copier does, so the pointer rule and custom methods apply to them. The trim tests cover copying a `DiffCache` backed by `Vector{Float64}`.
 
 `LazyBufferCache` and `GeneralLazyBufferCache` use the generic field copier. Their buffers are in a `Dict{Any, Any}`, so copying them needs runtime dispatch and is not trim-safe.
+
+### SharedArrays and SparseArrays
+
+Loading SharedArrays enables an extension that copies a `SharedArray` with Base's method. The copy gets a new shared-memory segment on the same workers. A field copy would keep the original's segment, so the workers would write into the original. Base's method copies the bits of the elements. When the element type can hold a raw pointer, each element then gets the rule for array elements: the method for its type, or `PointerCopyError`.
+
+Loading SparseArrays enables an extension for the CHOLMOD solve workspace, which SparseArrays defines from Julia 1.14. The workspace owns C buffers through raw pointers. Base's method makes the copy, a new, empty workspace that allocates its own buffers in a solve.
 
 ## Trimmed programs
 
@@ -142,14 +153,23 @@ Concrete types alone do not guarantee a trim build: copy methods must also avoid
 
 ## Other limits and errors
 
-- Copying is recursive; a long linked list can overflow the stack.
-- Objects must satisfy their type's initialization rules. Illegally uninitialized fields created through Julia internals can crash the copy.
-- A key that refers back to its table can be inserted before its fields finish copying. If its hash reads those fields, the hash can later change and break lookup. Base also encounters unfinished keys. A custom method must copy hash-relevant fields before the table.
-- Copied `Dict`, `IdDict` and `IdSet` tables do not preserve aliases to separately copied internal storage. Base preserves that alias for `IdSet`, but can break its member lookups on Julia 1.11–1.13.
-- A custom method returning the wrong nested type raises `TypeError`.
-- A builtin with hidden contents and no copy method raises `ArgumentError`.
-- On Julia 1.11 and later, a `GenericMemory` other than `Memory`, such as `AtomicMemory`, raises `PointerCopyError` for its `ptr` field. `Base.deepcopy` also fails on it.
+### Shared with Base.deepcopy
+
+`Base.deepcopy` has the same limits:
+
+- Copying is recursive, so a long linked list can overflow the stack. Both implementations raise `StackOverflowError`.
+- Objects must satisfy their type's initialization rules. An object with an illegally unset field, made through Julia internals, can crash either implementation.
+- A custom method that returns a value of the wrong type raises `TypeError`, at the top level and inside fields and arrays.
 - Copying a module raises `ErrorException`.
+- Each copied `SharedArray` gets a new segment of its own. A `reshape` of a `SharedArray`, and its `sdata` array, use the segment of the original, but their copies do not use the segment of the copy.
+- From Julia 1.11, neither implementation can copy a `GenericMemory` other than `Memory`, such as `AtomicMemory`. This package raises `PointerCopyError`, which names the `ptr` field and asks for a method. `Base.deepcopy` raises `TypeError: in new, expected DataType`.
+
+### Different from Base.deepcopy
+
+In these cases, `Base.deepcopy` crashes or gives a broken copy, and this package does better:
+
+- If a dictionary key holds a reference to the dictionary, the copied dictionary receives the key before the copy sets the key's fields. When the key's hash reads those fields, `Base.deepcopy` reads them unset. On Julia 1.10 to 1.13 and 1.14-DEV, that crashed the process in our tests. Before the copy sets those fields, two different keys can also compare equal, so that one entry replaces the other. This package keeps the copied entries of each `Dict` whose key type can reach a mutable object. After the copy, it refills a table that lost or misplaced an entry. The check looks up each key of such a table once. [test/examples/cyclic_key.jl](test/examples/cyclic_key.jl) shows both results.
+- From Julia 1.11, `Base.deepcopy` keeps the stale objectids of the original members in the index of the copied `IdSet`, so the copied set does not find most of its members. This package rebuilds the set, so lookups work. On Julia 1.10, both implementations give the same result.
 
 ## Performance
 
@@ -163,6 +183,7 @@ Run `julia --project bench/deepcopy.jl`. It reports the lowest batch-average tim
 | 100 media (nested structs, dicts and Union fields) | 126 µs, 362 kB | 36 µs, 253 kB |
 | Dict of 1 000 vectors, String keys | 121 µs, 391 kB | 76 µs, 301 kB |
 | Dict of 1 000 vectors, Symbol keys | 80 µs, 359 kB | 41 µs, 269 kB |
+| Dict of 1 000 vectors, mutable keys | 134 µs, 391 kB | 88 µs, 360 kB |
 | 1 000 immutable structs holding vectors | 351 µs, 1.08 MB | 121 µs, 761 kB |
 | 10 000 mutable structs in a `Vector{Any}` | 690 µs, 1.70 MB | 262 µs, 594 kB |
 | Linked list of 1 000 nodes | 73 µs, 122 kB | 47 µs, 122 kB |
@@ -183,24 +204,9 @@ On Julia 1.12+, the suite also builds and runs a trimmed executable. Each trim s
 
 Released Julia versions also run Aqua on the package and JET on the package and extension copy methods. The main suite checks ambiguities with extensions loaded; Aqua's isolated ambiguity check loads only the package. QA uses a separate process and environment in `test/qa/Project.toml`. Nightly skips QA because JET does not support prereleases.
 
-The seeded fuzzer checks types, values, undefined fields, aliases, cycles and mutable isolation, including shared array storage. It also checks `Base.deepcopy`, with matching methods for the custom test types.
+The suite also lists the `Base.deepcopy_internal` methods of Base and of every standard library of the running Julia version. The list must match the expected list for that version, and the package must handle each type in it. A Julia version without an expected list fails this check.
 
-For a longer run with worker processes:
-
-```sh
-julia scripts/fuzz_hammer.jl 60
-```
-
-This launches workers for 60 minutes, then waits for active rounds to finish. It uses `Pkg.test` in a temporary environment. Workers vary graph types and sizes, copy copies, request GC and call copied wrappers. Summaries go to `scripts/logs/hammer.log`; failed worker logs are retained beside it until the next run.
-
-Reproduce with the same Julia version and code:
-
-```sh
-julia scripts/fuzz_hammer.jl reproduce <round> <seed>
-julia scripts/fuzz_hammer.jl reproduce <round> <family>
-```
-
-The first command checks one seed in each family (a group of generated test types). The second scans the named family (`plain`, `method` or `trim`), printing each seed before running it, until a check fails or the process exits.
+The suite also runs a seeded fuzzer, [test/fuzz.jl](test/fuzz.jl), and explicit cases, [test/fuzz_cases.jl](test/fuzz_cases.jl). For long runs, see the headers of [scripts/fuzz_hammer.jl](scripts/fuzz_hammer.jl) and [scripts/fuzz_trim.jl](scripts/fuzz_trim.jl).
 
 To run the suite on Julia 1.10 through nightly at once, with juliaup installed:
 

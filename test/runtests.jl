@@ -1,11 +1,12 @@
 using SpecializedDeepcopy
 using BlockArrays: BlockArrays, BlockedArray   # types.jl defines a `Block` of its own
 using FunctionWrappers: FunctionWrapper
-using LinearAlgebra: Diagonal, Symmetric, transpose
+using LinearAlgebra: Diagonal, Symmetric, cholesky, ldiv!, transpose
 using OffsetArrays: OffsetArray
 using PreallocationTools: DiffCache, FixedSizeDiffCache, get_tmp
 using Random: Xoshiro
-using SparseArrays: nonzeros, sparse
+using SharedArrays: SharedArray, sdata
+using SparseArrays: SparseArrays, nonzeros, sparse
 using Test
 
 # `Pkg.test(; test_args = ["hammer", ...])` selects the stress runner in scripts/fuzz_hammer.jl.
@@ -16,6 +17,12 @@ end
 
 include("types.jl")
 include(joinpath("trim", "shapes.jl")) # includes fuzz.jl
+include("fuzz_cases.jl")
+# The README's examples. Each file defines its types and a function that runs their tests.
+include(joinpath("examples", "cyclic_key.jl"))
+include(joinpath("examples", "externally_allocated_memory.jl"))
+include(joinpath("examples", "wrapped_mutable_callable.jl"))
+include(joinpath("examples", "result_cache.jl"))
 
 # Compare the plain family with Base.deepcopy; test custom overrides in a separate family.
 const FUZZ_FAMILY = Fuzz.define_types!(Xoshiro(1), 12)
@@ -23,7 +30,7 @@ const FUZZ_METHOD_FAMILY = Fuzz.define_types!(Xoshiro(3), 12; methods = true)
 
 # The stress runner of scripts/fuzz_hammer.jl, with the Fuzz module of this process.
 module HammerTool
-import ..Fuzz
+import ..Fuzz, ..FuzzCases
 include(joinpath(dirname(@__DIR__), "scripts", "fuzz_hammer.jl"))
 end
 
@@ -34,19 +41,22 @@ end
 SpecializedDeepcopy.specialized_deepcopy(x::WrongType, copies) = Float64(x.id)
 (x::WrongType)(n::Int) = n * x.id
 
+# Wrong-type methods for both copies, at the top level, in a field and in an array.
+mutable struct Misfit
+    id::Int
+end
+struct MisfitHolder
+    misfit::Misfit
+end
+SpecializedDeepcopy.specialized_deepcopy(x::Misfit, copies) = Float64(x.id)
+Base.deepcopy_internal(x::Misfit, ::IdDict) = Float64(x.id)
+
 # Plain values must bypass this override.
 struct PlainId
     id::Int
 end
 SpecializedDeepcopy.specialized_deepcopy(x::PlainId, copies) = error("a method was called for a plain value")
 (x::PlainId)(n::Int) = n * x.id
-
-# A stateful model parameter: a gain and a call counter.
-mutable struct CountingGain
-    k::Float64
-    calls::Int
-end
-(g::CountingGain)(x) = (g.calls += 1; g.k * x)
 
 # Callables that hold another wrapper, as a composed model function can: one stored inline in its Ref,
 # and one mutable.
@@ -164,9 +174,41 @@ function recursive_closure()
     return fib
 end
 
+# Tuple and named tuple keys that hold a type of their own, with methods that change them.
+struct KeyTag
+    id::Int
+end
+SpecializedDeepcopy.specialized_deepcopy(k::Tuple{KeyTag, String}, copies) = (k[1], "copied-" * k[2])
+SpecializedDeepcopy.specialized_deepcopy(k::@NamedTuple{tag::KeyTag, name::String}, copies) = (tag = k.tag, name = "copied-" * k.name)
+
+# An immutable key type that refers to itself.
+struct KeyChain
+    name::String
+    next::Union{Nothing, KeyChain}
+end
+
+# A key that reaches its table through other objects, with a hash that reads a field of one of them.
+mutable struct Circuit
+    pins::Any
+    owner::Vector{Int}
+end
+struct Pin
+    circuit::Circuit
+end
+Base.hash(p::Pin, h::UInt) = hash(objectid(p.circuit.owner), h)
+
 # Run code in a fresh Julia process with this test project and capture stdout.
 run_isolated(code, flags = ``) =
     read(`$(Base.julia_cmd()) --startup-file=no $flags --project=$(Base.active_project()) -e $code`, String)
+
+# Run code that can fail or crash in a fresh Julia process. Return whether the process succeeded,
+# and its stdout. Its stderr, such as a crash report, is discarded.
+function run_outcome(code)
+    output = IOBuffer()
+    command = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $code`
+    finished = success(pipeline(command; stdout = output, stderr = devnull))
+    return finished, String(take!(output))
+end
 
 @testset "SpecializedDeepcopy" begin
     @testset "method table" begin
@@ -335,8 +377,9 @@ run_isolated(code, flags = ``) =
         copied = specialized_deepcopy(plain)
         @test copied == plain && copied !== plain
 
-        # Tables with value-hashed keys keep their slots: lookups by the original keys work, values
-        # are copied, and a deleted slot stays deleted.
+        # Tables with String, Symbol, plain or Union keys keep their slots, and tables with tuple keys
+        # that hold a String are rebuilt. Either way, lookups by the original keys work, values are
+        # copied, and a deleted entry stays deleted.
         stable = (
             Dict("key$i" => [Float64(i)] for i in 1:40),
             Dict(("key$i", i) => [i] for i in 1:40),
@@ -370,6 +413,40 @@ run_isolated(code, flags = ``) =
         mixed = Dict{Any, Any}(owner => 1, "s" => 2, 3 => 3)
         copied = specialized_deepcopy(mixed)
         @test copied[only(k for k in keys(copied) if k isa Owner)] == 1 && copied["s"] == 2 && !haskey(copied, owner)
+        # A method can change a tuple or named tuple key that holds a type of its own, so its table is
+        # rebuilt, also when the declared key type is a Union.
+        tagged = [(KeyTag(i), "key$i") for i in 1:40]
+        named = [(tag = KeyTag(i), name = "key$i") for i in 1:40]
+        for table in (Dict(k => [i] for (i, k) in pairs(tagged)), Dict(k => [i] for (i, k) in pairs(named)),
+                Dict{Union{Nothing, Tuple{KeyTag, String}}, Vector{Int}}(k => [i] for (i, k) in pairs(tagged)))
+            copied = specialized_deepcopy(table)
+            @test length(copied) == 40 && all(k -> startswith(k[2], "copied-") && haskey(copied, k), keys(copied))
+        end
+        # The hash of this key reads a field that the copy sets after the table receives the key. The
+        # check after the copy reinserts the entry. test/examples/cyclic_key.jl has the direct case.
+        circuit = Circuit(nothing, [1])
+        circuit.pins = (Dict(Pin(circuit) => 1),)
+        copied = specialized_deepcopy(circuit)
+        @test copied.pins[1][Pin(copied)] == 1 && copied.owner !== circuit.owner
+        # Two keys whose equality reads whether `left` and `right` are one vector compare equal for a
+        # moment of the copy that starts from the key with one vector. The table keeps both entries in
+        # either root order.
+        shared = [0]
+        aliases = Dict{Fuzz.AliasKey, Int}()
+        alias_keys = (Fuzz.AliasKey(1, shared, aliases, shared), Fuzz.AliasKey(2, [1], aliases, [2]))
+        aliases[alias_keys[1]], aliases[alias_keys[2]] = 1, 2
+        for value in (alias_keys, (aliases, alias_keys...))
+            copied = specialized_deepcopy(value)
+            @test Fuzz.check(value, copied) === nothing && length(copied[end].table) == 2
+        end
+        # Two copied keys that are equal after the copy cannot both stay: an error, not a lost entry.
+        copies = IdDict{Any, Any}()
+        SpecializedDeepcopy._check_later!(copies, Dict{Vector{Int}, Int}(), [[1] => 1, [1] => 2])
+        @test_throws ArgumentError SpecializedDeepcopy._check_tables!(copies)
+        # Only a table whose keys can change after the table receives them gets that check.
+        settled = (String, Tuple{String, Int}, @NamedTuple{tag::KeyTag, name::String}, Union{Nothing, Symbol}, KeyChain)
+        @test all(SpecializedDeepcopy._settled_key, settled)
+        @test !any(SpecializedDeepcopy._settled_key, (Owner, Pin, Tuple{Owner, Int}, Any, Vector{Int}))
     end
 
     @testset "Base types" begin
@@ -485,10 +562,6 @@ run_isolated(code, flags = ``) =
         @test length(copied) == 16 && all(k -> haskey(copied, k), keys(copied)) && isdisjoint(keys(copied), keys(table))
         @test all(k -> KEY_BYTES[k.address] == UInt8[copied[k]], keys(copied))
         @test !any(SpecializedDeepcopy._stable_hash, (BytesKey, Union{String, BytesKey}, Tuple{Int, BytesKey}))
-        # A GenericMemory other than Memory has no copy method; its pointer field is rejected.
-        @static if isdefined(Base, :AtomicMemory)
-            @test_throws PointerCopyError(Base.AtomicMemory{Int}, :ptr) specialized_deepcopy(Base.AtomicMemory{Int}(undef, 2))
-        end
     end
 
     @testset "methods for user types" begin
@@ -780,40 +853,13 @@ run_isolated(code, flags = ``) =
         copied, again = specialized_deepcopy((rebuilt, rebuilt))
         @test copied === again && copied[only(keys(copied))] == 1 && !haskey(copied, owner)
 
-        # A table reached through its key hashes that key before the owner field is copied.
-        # OwnedKey copies the owner first, so the hash stays valid.
-        stale = StaleHashKey(Dict{StaleHashKey, Int}(), [1])
-        stale.table[stale] = 1
-        copied = specialized_deepcopy(stale)
-        @test only(keys(copied.table)) === copied && copied.owner !== stale.owner && !haskey(copied.table, copied)
-        owned = OwnedKey(Dict{OwnedKey, Int}(), [1])
-        owned.table[owned] = 1
-        for value in ((owned,), (owned.owner, owned))
-            copied = last(specialized_deepcopy(value))
-            @test only(keys(copied.table)) === copied && copied.owner !== owned.owner && copied.table[copied] == 1
-        end
-
         @test_throws PointerCopyError(WeakRef, nothing) specialized_deepcopy(WeakKeyDict(owner => 1))
     end
 
     # Compare generic copying with overrides that preserve each resource's invariants.
     @testset "situations that need a method" begin
-        # Base aliases the C allocation; this package rejects the unhandled pointer.
-        buffer = MallocBuffer(4)
-        unsafe_store!(buffer.data, 0x07)
-        @test deepcopy(buffer).data == buffer.data
-        @test_throws PointerCopyError(MallocBuffer, :data) specialized_deepcopy(buffer)
-        @test unsafe_load(buffer.data) == 0x07
-        # OwnedBuffer's allocation must survive finalizing the original.
-        owned = OwnedBuffer(4)
-        unsafe_store!(owned.data, 0x07)
-        copied = specialized_deepcopy(owned)
-        GC.gc()
-        unsafe_store!(copied.data, 0x09)
-        @test copied.data != owned.data && unsafe_load(owned.data) == 0x07
-        finalize(owned)
-        @test unsafe_load(copied.data) == 0x09
-        finalize(copied)
+        # Base.deepcopy keeps the address of C memory, and a method duplicates the memory.
+        test_externally_allocated_memory()
 
         # The strdup copy must survive finalizing the original string owner.
         text = CText("parameters")
@@ -841,38 +887,14 @@ run_isolated(code, flags = ``) =
         copied = specialized_deepcopy(table)
         @test copied.addresses == [address] && copied.addresses !== table.addresses
 
-        # Base keeps the pointer to the original closure; the extension redirects it to the copy.
+        # The extension points the copy of a closure's wrapper at the copied closure.
         weights = [1.0]
         wrapper = FunctionWrapper{Float64, Tuple{Float64}}(x -> weights[1] * x)
         copied, again = specialized_deepcopy((wrapper, wrapper))
         weights[1] = 2.0
         @test copied === again && copied(1.0) == 1.0 && wrapper(1.0) == 2.0
-        # A fresh process avoids the fuzz oracle's Base.deepcopy override for FunctionWrapper.
-        base_copy = """
-            using FunctionWrappers: FunctionWrapper
-            weights = [1.0]
-            wrapper = FunctionWrapper{Float64, Tuple{Float64}}(x -> weights[1] * x)
-            field_copy = deepcopy(wrapper)
-            weights[1] = 2.0
-            print(field_copy(1.0))
-            """
-        @test run_isolated(base_copy) == "2.0"
-        # ModelingToolkit wraps `f(::Real)` this way. The copy initializes its pointers eagerly
-        # and retains independent state through interleaved calls.
-        gain = CountingGain(2.0, 0)
-        original = FunctionWrapper{Real, Tuple{Real}}(gain)
-        independent = specialized_deepcopy(original)
-        copied_gain = independent.obj[]
-        @test copied_gain !== gain && independent.ptr != C_NULL
-        @test independent.objptr == pointer_from_objref(copied_gain) != original.objptr
-        GC.gc()
-        for _ in 1:3
-            original(1.0)
-            independent(1.0)
-        end
-        @test gain.calls == 3 && copied_gain.calls == 3
-        copied_gain.k = 5.0
-        @test independent(1.0) == 5.0 && original(1.0) == 2.0
+        # A stateful callable, as ModelingToolkit wraps `f(::Real)`, and Base.deepcopy's copy of it.
+        test_wrapped_mutable_callable()
         # A copied wrapper whose callable holds another wrapper calls the copied inner state.
         for Twice in (InlineTwice, MutableTwice)
             inner = FunctionWrapper{Float64, Tuple{Float64}}(let w = [3.0]; x -> w[1] * x end)
@@ -997,21 +1019,15 @@ run_isolated(code, flags = ``) =
         # Share the stream explicitly instead of copying its internal C handle.
         mktemp() do path, io
             @test deepcopy(io).handle == io.handle
-            @test_throws PointerCopyError(IOStream, :handle) specialized_deepcopy(PlainLogger(io, 1))
+            @test_throws PointerCopyError(IOStream, :handle) specialized_deepcopy(LoggerWithoutMethod(io, 1))
             copied = specialized_deepcopy(Record(Logger(io, 1)))
             print(copied.value.io, "shared")
             flush(io)
             @test copied.value.io === io && read(path, String) == "shared"
         end
 
-        # The override clears the cache instead of copying weak keys.
-        owner = Owner(1.0)
-        @test_throws PointerCopyError(WeakRef, nothing) specialized_deepcopy(PlainResultCache(WeakKeyDict(owner => [1.0])))
-        cache = ResultCache(WeakKeyDict(owner => [1.0]))
-        copied = specialized_deepcopy(cache)
-        other = Owner(2.0)
-        copied.results[other] = [2.0]
-        @test length(copied.results) == 1 && length(cache.results) == 1 && !haskey(cache.results, other)
+        # The method clears the cache instead of copying weak keys.
+        test_result_cache()
 
         # Registry's assertion removes dispatch; the trim suite also tests the unhandled abstract field.
         @test specialized_deepcopy(Registry(Owner(3.0))).owner.id == 3.0
@@ -1062,6 +1078,9 @@ run_isolated(code, flags = ``) =
             print(copied[1].next === copied[1] === copied[2][1] === copied[3][1] !== node)
             """
         @test run_isolated(code, `--compile=min`) == "true"
+        # Without compiled modules, Julia 1.12 and later resolve the bindings of a generated function
+        # in source order; the @cfunction of the table check needs its function defined first.
+        @test run_isolated("using SpecializedDeepcopy; print(specialized_deepcopy(Dict([1] => 2))[[1]])", `--compiled-modules=no`) == "2"
 
         # The recursion relation is set on the loaded, precompiled package.
         @test all(m -> isdefined(m, :recursion_relation) && m.recursion_relation === SpecializedDeepcopy._copy_recursion_ends,
@@ -1215,6 +1234,76 @@ run_isolated(code, flags = ``) =
         end
     end
 
+    include("deepcopy_internal_methods.jl")
+
+    # Each item of "Shared with Base.deepcopy" in the README, for both implementations. The item about
+    # initialization rules has no test: breaking those rules is undefined behavior.
+    @testset "limits shared with Base.deepcopy" begin
+        copiers = (specialized_deepcopy, deepcopy)
+        # Both implementations are recursive: 1000 nodes copy, and a million overflow the stack of a fresh process.
+        chain(n) = foldl((next, _) -> Node("node", next), 1:n; init = nothing)
+        length_of(node) = (n = 0; while node !== nothing; n += 1; node = node.next; end; n)
+        @test all(copier -> length_of(copier(chain(1000))) == 1000, copiers)
+        code = """
+            using SpecializedDeepcopy
+            include($(repr(joinpath(@__DIR__, "types.jl"))))
+            long = foldl((next, _) -> Node("node", next), 1:1_000_000; init = nothing)
+            for copier in (specialized_deepcopy, deepcopy)
+                try
+                    copier(long)
+                    print("copied ")
+                catch e
+                    print(nameof(typeof(e)), " ")
+                end
+            end
+            """
+        @test run_outcome(code) == (true, "StackOverflowError StackOverflowError ")
+        # A method that returns the wrong type, and a module.
+        for copier in copiers
+            @test_throws TypeError copier(Misfit(1))
+            @test_throws TypeError copier(MisfitHolder(Misfit(1)))
+            @test_throws TypeError copier([Misfit(1)])
+            @test_throws ErrorException copier(Base)
+            @test_throws ErrorException copier((1, Base))
+        end
+        # A reshape and the sdata array use the segment of the original SharedArray, but not of its copy.
+        array = SharedArray{Float64}(2; pids = [1])
+        array .= 0.0
+        for copier in copiers
+            copied, backing, shaped = copier((array, sdata(array), reshape(array, 1, 2)))
+            copied[1] = 9.0
+            @test backing[1] == 0.0 && shaped[1] == 0.0
+        end
+        # From Julia 1.11, neither implementation copies a GenericMemory other than Memory. This
+        # package raises a PointerCopyError that names the field, and Base.deepcopy a TypeError.
+        @static if isdefined(Base, :AtomicMemory)
+            atomic = Base.AtomicMemory{Int}(undef, 2)
+            @test_throws PointerCopyError(Base.AtomicMemory{Int}, :ptr) specialized_deepcopy(atomic)
+            @test_throws TypeError deepcopy(atomic)
+            message = sprint(showerror, PointerCopyError(Base.AtomicMemory{Int}, :ptr))
+            @test occursin("`ptr`", message) && occursin("Add a method", message)
+        end
+    end
+
+    # Each item of "Different from Base.deepcopy" in the README, for both implementations.
+    @testset "limits that differ from Base.deepcopy" begin
+        # A key whose hash reads a field that the copy has not finished: Base.deepcopy crashes the
+        # process, and this package completes, with a method that fixes the key's table.
+        test_cyclic_key()
+
+        # From Julia 1.11, Base.deepcopy keeps the stale objectids of the original members in the
+        # index of the copied IdSet.
+        members = [Owner(Float64(i)) for i in 1:5]
+        set = Base.IdSet{Owner}(members)
+        storage = getfield(set, 1)  # the IdDict before Julia 1.11, the member list from 1.11
+        copied, copied_storage = specialized_deepcopy((set, storage))
+        @test length(copied) == 5 && all(m -> m in copied, collect(copied)) && !any(m -> m in copied, members)
+        @test (getfield(copied, 1) === copied_storage) == (VERSION < v"1.11")
+        base_copied, base_storage = deepcopy((set, storage))
+        @test getfield(base_copied, 1) === base_storage
+        @test all(m -> m in base_copied, collect(base_copied)) == (VERSION < v"1.11")
+    end
+
     # Check the oracle's rejection cases, then run fixed seeds with copier and family diagnostics.
     @testset "fuzz" begin
         vector = [1.0]
@@ -1287,6 +1376,35 @@ run_isolated(code, flags = ``) =
             @test Fuzz.check((visible,), (wrong_visible,)) !== nothing
             @test Fuzz.check((visible, hidden), specialized_deepcopy((visible, hidden))) === nothing
         end
+        # Tables with fixture keys: the checker pairs entries by key ID and compares keys like values.
+        # A key in a stale slot: the only entry of a copied table moves to another slot, so a lookup
+        # from the key's hash reaches an empty slot.
+        function move_entry!(d::Dict)
+            i = findfirst(j -> Base.isslotfilled(d, j), eachindex(d.slots))
+            j = i == lastindex(d.slots) ? firstindex(d.slots) : i + 1
+            d.keys[j], d.vals[j], d.slots[j], d.slots[i] = d.keys[i], d.vals[i], d.slots[i], 0x00
+            d.idxfloor = firstindex(d.slots)
+            return d
+        end
+        table = Dict(Fuzz.IdentityKey(1) => [1])
+        @test Fuzz.check(table, specialized_deepcopy(table)) === nothing
+        @test occursin("does not find its entry", Fuzz.check(table, move_entry!(specialized_deepcopy(table))))
+        # A key and a value that share an owner, and a copy where they do not.
+        owner = [1]
+        shared = Dict(Fuzz.ContentKey(1, owner) => owner)
+        @test Fuzz.check(shared, specialized_deepcopy(shared)) === nothing
+        @test occursin("not shared by the copy", Fuzz.check(shared, Dict(Fuzz.ContentKey(1, [1]) => [1])))
+        # Distinct keys that become one: two copied keys with one ID, or one entry for two.
+        ids = IdDict(Fuzz.IdentityKey(1) => 1, Fuzz.IdentityKey(2) => 2)
+        @test occursin("two keys of the copy", Fuzz.check(ids, IdDict(Fuzz.IdentityKey(1) => 1, Fuzz.IdentityKey(1) => 2)))
+        contents = Dict(Fuzz.ContentKey(1, [1]) => 1, Fuzz.ContentKey(2, [2]) => 2)
+        @test occursin("length 2 became 1", Fuzz.check(contents, Dict(Fuzz.ContentKey(1, [1]) => 1)))
+        # A copy method that changes a tuple key, and a copy without the change.
+        tagged = Dict((Fuzz.Tag(1), "a") => 1)
+        @test Fuzz.check(tagged, specialized_deepcopy(tagged)) === nothing
+        @test occursin("did not run", Fuzz.check(tagged, Dict((Fuzz.Tag(1), "a") => 1)))
+        # Two original keys with one ID make the pairing ambiguous.
+        @test_throws ErrorException Fuzz.check(IdDict(Fuzz.IdentityKey(1) => 1, Fuzz.IdentityKey(1) => 2), ids)
         # Reject lost aliases, merged aliases and reused originals for big numbers.
         number, equal_number = big(1), big(1)
         @test Fuzz.check((number, number), (big(1), big(1))) !== nothing
@@ -1329,25 +1447,101 @@ run_isolated(code, flags = ``) =
         end
     end
 
+    # The explicit shapes and extension contracts of test/fuzz_cases.jl, with fixed seeds.
+    @testset "fuzz cases" begin
+        for seed in 1:3, case in FuzzCases.cases(Xoshiro(seed))
+            reports = case.run()
+            isempty(reports) || println("fuzz case $(case.name), seed $seed: ", join(reports, "; "))
+            @test isempty(reports)
+        end
+    end
+
     @testset "stress runner" begin
         @test HammerTool.settings(["5", "2"]) == (5.0, 2)
         for args in (["0"], ["-1"], ["NaN"], ["Inf"], ["5", "0"])
             @test_throws ArgumentError HammerTool.settings(args)
         end
         @test_throws ArgumentError HammerTool.reproduce(1, "unknown")
+        @test HammerTool.reproduce_arguments(["7", "42"]) == (7, 42)
+        @test HammerTool.reproduce_arguments(["7", "method", "42"]) == (7, "method", 42)
         # A worker that ends early, ends by a signal, or exits with a status that does not match its
-        # FAIL lines has crashed.
-        done, fail = "DONE round=1 failures=0", "FAIL round=1 seed=2 family=plain copy: at the root"
+        # FAIL lines has crashed. A worker without a FAMILY line did not start.
+        family, done = "FAMILY round=1 family=plain layouts=8", "DONE round=1 failures=0"
+        fail = "FAIL round=1 family=plain seed=2 rng=0x01 copy: at the root: family=trim seed=9"
         @test HammerTool.completed([done], 0, 0) && HammerTool.completed([fail, done], 1, 0)
-        @test !HammerTool.completed(["FAMILY round=1 family=plain"], 0, 0) && !HammerTool.completed([done], 0, 9)
+        @test !HammerTool.completed([family], 0, 0) && !HammerTool.completed([done], 0, 9)
         @test !HammerTool.completed([done], 1, 0) && !HammerTool.completed([fail, done], 0, 0)
+        @test HammerTool.outcome([family, done], 0, 0) == "ok" && HammerTool.outcome([family, fail, done], 1, 0) == "failed"
+        @test HammerTool.outcome([family], 0, 9) == "crash" && HammerTool.outcome(String[], 1, 0) == "infrastructure"
+        @test HammerTool.outcome([family], 0, 0; timed_out = true) == "timeout"
+        @test HammerTool.outcome([family], 0, 0; interrupted = true) == "interrupted"
+        # The fields of a FAIL line come from its prefix, not from its message.
+        @test HammerTool.fields(fail)["family"] == "plain" && HammerTool.fields(fail)["seed"] == "2"
+        # Exact seed counts below the 25 seeds between PROGRESS lines: from COMPLETED lines, and for a
+        # family that did not complete, the seeds before the case in the case file.
+        lines = [family, "COMPLETED round=1 family=plain seeds=7", "FAMILY round=1 family=method layouts=9"]
+        @test HammerTool.completed_seeds(lines, "round=1 family=method seed=4 rng=0x02 stage=copy") == Dict("plain" => 7, "method" => 3)
+        # A PROGRESS line confirms the case in the record when the worker ended before the next record.
+        progress = [family, "PROGRESS round=1 family=plain seed=25"]
+        @test HammerTool.completed_seeds(progress, "round=1 family=plain seed=25 rng=0x02 stage=wrapper calls after GC") == Dict("plain" => 25)
+        # A log that shows a failure stays, also when the driver stopped its worker.
+        @test HammerTool.keep_log("interrupted", [family, fail]) && HammerTool.keep_log("crash", [family])
+        @test !HammerTool.keep_log("interrupted", [family]) && !HammerTool.keep_log("ok", [family, done])
+        # A replay sets the compile mode of its run, whatever the mode of the process that starts it.
+        @test HammerTool.replay_flag("compiled") == `--compile=yes` && HammerTool.replay_flag("interpreted") == `--compile=min`
+        # A run starts only through the script, which copies the source for replays.
+        @test_throws ArgumentError HammerTool.hammer(["5", "2"])
+        # The explicit cases of a round, one at a time.
+        @test HammerTool.reproduce(1, "cases", 2) == 0
+        @test_throws ArgumentError HammerTool.reproduce(1, "cases", 999)
+        # An exception ends a case with its stage and backtrace; here generation finds no types.
+        report = only(HammerTool.exercise(DataType[], true, 1, 1))
+        @test startswith(report, "exception in stage generate: ArgumentError") && occursin("Stacktrace", report)
         # Both output streams of a worker reach its log, also after the driver closes its handle.
         log = tempname()
         code = "sleep(0.5); print(stdout, \"out\\n\"); flush(stdout); print(stderr, \"err\\n\")"
         wait(HammerTool.launch(`$(Base.julia_cmd()) --startup-file=no -e $code`, log))
         @test readlines(log) == ["out", "err"]
-        # The checks of a worker for one seed of each family.
+        # The watchdog stops a worker past its limit, and the driver can collect it.
+        sleeper = HammerTool.launch(`$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"`, tempname())
+        start = time_ns()
+        @test !HammerTool.overdue(start, 60) && HammerTool.overdue(start - UInt64(61 * 10^9), 60)
+        HammerTool.stop!(sleeper)
+        @test process_exited(sleeper) && !success(sleeper)
+        # The checks of a worker for one seed of each family, and for one seed of one family only.
         @test HammerTool.reproduce(1, 1) == 0
+        @test HammerTool.reproduce(1, "plain", 3) == 0
+        # The replay of a run requires the package from the run's source.
+        @test HammerTool.hammer(["replay", pkgdir(SpecializedDeepcopy), "7", "1", "plain", "1"]) == 0
+        @test redirect_stdout(() -> HammerTool.hammer(["replay", tempdir(), "7", "1", "plain", "1"]), devnull) == 1
+        # A worker reports the exact count of each family and of the explicit cases.
+        output = tempname()
+        status = open(io -> redirect_stdout(() -> HammerTool.worker(1, 0.0, mktempdir(), UInt(7)), io), output, "w")
+        lines = readlines(output)
+        @test status == 0 && last(lines) == "DONE round=1 failures=0"
+        expected = Dict("plain" => 0, "method" => 0, "trim" => 0, "cases" => length(FuzzCases.cases(Xoshiro(1))))
+        @test HammerTool.completed_seeds(lines, "") == expected
+        # Ctrl-C stops the active worker, which is not a crash, and the driver still writes its summary.
+        # Rounds count from 1 in each run, and a run leaves the files of an earlier run alone.
+        parent = mktempdir()
+        earlier = mkpath(joinpath(parent, "run-earlier"))
+        write(joinpath(earlier, "round-7.log"), "FAIL round=7 family=plain seed=3 rng=0x03 copy: at the root\n")
+        run = joinpath(parent, "run-later")
+        status = redirect_stdout(devnull) do
+            task = @async HammerTool.driver(1, 1; run)
+            # Once the round log exists, the driver task waits in `sleep`, where Ctrl-C reaches it.
+            timedwait(() -> isfile(joinpath(run, "round-1.log")), 60)
+            schedule(task, InterruptException(); error = true)
+            fetch(task)
+        end
+        @test status == 1
+        @test readdir(run) == ["environment", "hammer.log", "run.toml"]
+        @test isfile(joinpath(earlier, "round-7.log"))
+        summary = readlines(joinpath(run, "hammer.log"))
+        @test any(startswith("hammer: interrupted after 0 min, 1 rounds, 0 cases"), summary)
+        # A run that checked no case does not pass.
+        @test last(summary) == "hammer: no case completed"
+        @test occursin("status = \"interrupted\"", read(joinpath(run, "run.toml"), String))
     end
 
     # Check ordinary copying for every trim fixture, including expected trim failures.
@@ -1393,7 +1587,7 @@ run_isolated(code, flags = ``) =
 
                 [compat]
                 BlockArrays = "1"
-                FunctionWrappers = "1"
+                FunctionWrappers = "1.1.2"
                 JuliaC = "0.3"
                 PreallocationTools = "1"
 
@@ -1409,7 +1603,8 @@ run_isolated(code, flags = ``) =
             built || print(read(log, String))
             @test built
 
-            executable = joinpath(out, "program", "bin", "specialized_deepcopy_trim")
+            # JuliaC adds .exe to the executable on Windows.
+            executable = joinpath(out, "program", "bin", "specialized_deepcopy_trim" * (Sys.iswindows() ? ".exe" : ""))
             @test isfile(executable)
             if isfile(executable)
                 lines = readlines(`$executable`)
