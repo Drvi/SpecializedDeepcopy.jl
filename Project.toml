@@ -1,0 +1,36 @@
+name = "SpecializedDeepcopy"
+uuid = "d9f839d0-568b-4a2d-afd8-98575451154f"
+authors = ["Tomas Drvostep <tomas.drvostep@juliahub.com>"]
+version = "0.1.0"
+
+[weakdeps]
+FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"
+PreallocationTools = "d236fae5-4411-538c-8e31-a6e3d9e00b46"
+
+[extensions]
+SpecializedDeepcopyFunctionWrappersExt = "FunctionWrappers"
+SpecializedDeepcopyPreallocationToolsExt = "PreallocationTools"
+
+[compat]
+BlockArrays = "1"
+FunctionWrappers = "1.1.2"
+LinearAlgebra = "1"
+OffsetArrays = "1"
+PreallocationTools = "1"
+Random = "1"
+SparseArrays = "1"
+Test = "1"
+julia = "1.10"
+
+[extras]
+BlockArrays = "8e7c35d0-a365-5155-bbbb-fb81a777f24e"
+FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+OffsetArrays = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
+PreallocationTools = "d236fae5-4411-538c-8e31-a6e3d9e00b46"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["BlockArrays", "FunctionWrappers", "LinearAlgebra", "OffsetArrays", "PreallocationTools", "Random", "SparseArrays", "Test"]
