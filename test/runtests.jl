@@ -1348,20 +1348,23 @@ end
         chain(n) = foldl((next, _) -> Node("node", next), 1:n; init = nothing)
         length_of(node) = (n = 0; while node !== nothing; n += 1; node = node.next; end; n)
         @test all(copier -> length_of(copier(chain(1000))) == 1000, copiers)
-        code = """
-            using SpecializedDeepcopy
-            include($(repr(joinpath(@__DIR__, "types.jl"))))
-            long = foldl((next, _) -> Node("node", next), 1:1_000_000; init = nothing)
-            for copier in (specialized_deepcopy, deepcopy)
+        # Each overflow runs in a process of its own. After a stack overflow, the state of the process can
+        # be corrupt, and a second overflow can crash it on Windows (see JuliaLang/julia#46870).
+        for copier in (:specialized_deepcopy, :deepcopy)
+            code = """
+                using SpecializedDeepcopy
+                include($(repr(joinpath(@__DIR__, "types.jl"))))
+                long = foldl((next, _) -> Node("node", next), 1:1_000_000; init = nothing)
                 try
-                    copier(long)
-                    print("copied ")
+                    $copier(long)
+                    print("copied")
                 catch e
-                    print(nameof(typeof(e)), " ")
+                    print(nameof(typeof(e)))
                 end
-            end
-            """
-        @test run_outcome(code) == (true, "StackOverflowError StackOverflowError ")
+                flush(stdout)
+                """
+            @test run_outcome(code) == (true, "StackOverflowError")
+        end
         # A method that returns the wrong type, and a module.
         for copier in copiers
             @test_throws TypeError copier(Misfit(1))

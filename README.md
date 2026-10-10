@@ -219,3 +219,7 @@ Each run uses a temporary environment and writes `scripts/logs/tests_<channel>.l
 ## License
 
 [MIT](LICENSE).
+
+## AI disclosure
+
+AI coding assistants (Claude, by Anthropic) wrote large parts of the code, the tests and the documentation. The maintainer directed the work and reviewed each change before the commit.
