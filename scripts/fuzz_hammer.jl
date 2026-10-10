@@ -213,9 +213,10 @@ function exercise(family, with_base, layout, seed; record = stage -> nothing)
     return reports
 end
 
-# Run the explicit cases of a round, or only case `only`. Return (index, name, failed checks) for
-# each case run. All cases are built, in order, so that each gets the same values.
-function run_cases(round, layout; record = line -> nothing, only = nothing)
+# Run the explicit cases of a round, or only case `only`. Call `done(index, name, failed checks)` after
+# each case, before the next one starts, and return these triples for all cases run. All cases are
+# built, in order, so that each gets the same values.
+function run_cases(round, layout; record = line -> nothing, done = (i, name, reports) -> nothing, only = nothing)
     results = Tuple{Int, String, Vector{String}}[]
     cases = FuzzCases.cases(Xoshiro(generator_seed(layout, :cases)))
     only === nothing || only in eachindex(cases) || throw(ArgumentError("round $round has cases 1 to $(length(cases)), not $only"))
@@ -229,6 +230,7 @@ function run_cases(round, layout; record = line -> nothing, only = nothing)
             ["exception in case $(case.name): " * sprint(showerror, e, catch_backtrace())]
         end
         push!(results, (i, case.name, reports))
+        done(i, case.name, reports)
     end
     return results
 end
@@ -250,6 +252,15 @@ function worker(round, seconds, run, run_seed)
         flush(case_io)
     end
     failures = 0
+    # Write the failed checks of a case at once: stdout is a file, and a later crash or SIGKILL loses
+    # its buffer.
+    function publish(prefix, reports)
+        for report in reports
+            failures += 1
+            print_failure(stdout, prefix, report)
+        end
+        isempty(reports) || flush(stdout)
+    end
     # Define the types first; the time budget of each family starts after this preparation.
     layout = layout_seed(run_seed, round)
     prepared = families(layout)
@@ -263,10 +274,7 @@ function worker(round, seconds, run, run_seed)
             prefix = "round=$round family=$name seed=$seed rng=$(repr(generator_seed(layout, seed)))"
             # The generated constructors are newer than this method's world age.
             reports = Base.invokelatest(exercise, family, with_base, layout, seed; record = stage -> record("$prefix stage=$stage"))
-            for report in reports
-                failures += 1
-                print_failure(stdout, prefix, report)
-            end
+            publish(prefix, reports)
             if seed % PROGRESS_EVERY == 0
                 println("PROGRESS round=$round family=$name seed=$seed")
                 flush(stdout)
@@ -276,11 +284,8 @@ function worker(round, seconds, run, run_seed)
         flush(stdout)
     end
     println("FAMILY round=$round family=cases")
-    results = run_cases(round, layout; record)
-    for (i, name, reports) in results, report in reports
-        failures += 1
-        print_failure(stdout, "round=$round family=cases seed=$i rng=$(repr(generator_seed(layout, :cases)))", "$name: $report")
-    end
+    results = run_cases(round, layout; record, done = (i, name, reports) ->
+        publish("round=$round family=cases seed=$i rng=$(repr(generator_seed(layout, :cases)))", ["$name: $report" for report in reports]))
     println("COMPLETED round=$round family=cases seeds=$(length(results))")
     close(case_io)
     println("DONE round=$round failures=$failures")
@@ -300,10 +305,14 @@ function reproduce(round, target, seed = nothing; run_seed = 0)
     failed = false
     try
         if target == "cases"
-            for (i, name, reports) in run_cases(round, layout; only = seed), report in reports
-                print_failure(stdout, "round=$round family=cases seed=$i", "$name: $report")
-                failed = true
+            function publish(i, name, reports)
+                for report in reports
+                    print_failure(stdout, "round=$round family=cases seed=$i", "$name: $report")
+                    failed = true
+                end
+                isempty(reports) || flush(stdout)
             end
+            run_cases(round, layout; only = seed, done = publish)
             return failed ? 1 : 0
         end
         for (name, family, with_base) in families(layout)
@@ -357,12 +366,13 @@ keep_log(result, lines) = !(result in ("ok", "interrupted")) || any(startswith("
 elapsed(start) = (time_ns() - start) / 1e9
 overdue(start, limit) = elapsed(start) > limit
 
-# Stop a process, by force if it does not end within 5 s.
-function stop!(process)
-    process_exited(process) && return
-    kill(process)
-    timedwait(() -> process_exited(process), 5.0) === :ok || kill(process, Base.SIGKILL)
-    wait(process)
+# Stop processes, by force if they do not end within 2 s: a Julia process does not always end on
+# SIGTERM. After Ctrl-C, Pkg.test gives the driver 4 s to stop its workers and write its summary.
+# kill skips a process that has ended.
+function stop!(processes)
+    foreach(kill, processes)
+    timedwait(() -> all(process_exited, processes), 2.0) === :ok || foreach(p -> kill(p, Base.SIGKILL), processes)
+    foreach(wait, processes)
     return
 end
 
@@ -456,13 +466,8 @@ function driver(minutes, workers; run, seconds = ROUND_SECONDS, allowance = ALLO
                     end
                     Base.reenable_sigint(() -> sleep(1))
                     # The watchdog: a worker past its rounds and allowance is stopped and reported.
-                    timed_out = Int[]
-                    for (r, w) in running
-                        if !process_exited(w.process) && overdue(w.start, limit)
-                            stop!(w.process)
-                            push!(timed_out, r)
-                        end
-                    end
+                    timed_out = [r for (r, w) in running if !process_exited(w.process) && overdue(w.start, limit)]
+                    stop!([running[r].process for r in timed_out])
                     for (r, w) in collect(running)
                         process_exited(w.process) || continue
                         delete!(running, r)
@@ -496,13 +501,11 @@ function driver(minutes, workers; run, seconds = ROUND_SECONDS, allowance = ALLO
                     end
                 catch e
                     e isa InterruptException && !interrupted || rethrow()
-                    # Launch no more rounds. The loop collects the stopped rounds as they end.
+                    # Launch no more rounds, and stop the running ones. The loop collects them.
                     interrupted = true
                     deadline = 0.0
-                    for (r, w) in running
-                        kill(w.process)
-                        push!(stopped, r)
-                    end
+                    union!(stopped, keys(running))
+                    stop!([w.process for w in values(running)])
                 end
             end
         end

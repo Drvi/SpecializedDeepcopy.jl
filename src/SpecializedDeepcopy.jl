@@ -20,8 +20,8 @@ a, b = specialized_deepcopy((weights, weights))
 ```
 
 Call this one-argument method once for all related values. After the copy, it completes each copied
-`Dict` whose keys can change during the copy. The two-argument method below serves custom methods
-inside that call.
+`Dict` whose keys can change during the copy, and raises `ArgumentError` when it cannot. The
+two-argument method below serves custom methods inside that call.
 
 Base copies raw pointer addresses unchanged. Here a raw pointer (`Ptr`, `Cstring`, `Cwstring` or
 `Core.LLVMPtr`) or `WeakRef` raises [`PointerCopyError`](@ref), unless an enclosing type's method

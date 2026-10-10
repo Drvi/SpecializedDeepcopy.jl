@@ -88,14 +88,15 @@ const _REBUILT_TABLES = _RebuiltTables()
 
 # A plain, String or Symbol key, or an immutable key whose fields have such types, is complete when
 # the copied table receives it, and no mutable object is reachable from it. So its hash and its
-# equality cannot change after the insertion, and its table needs no check. A type that refers to itself through a Union
-# field adds no other type.
+# equality cannot change after the insertion, and its table needs no check. Any other type without
+# fields, such as a raw pointer, can lead to objects outside its fields. A type that refers to itself
+# through a Union field adds no other type.
 function _settled_key(@nospecialize(K), seen = Any[])
     (_is_plain(K) || K === String || K === Symbol) && return true
     any(T -> T === K, seen) && return true
     push!(seen, K)
     K isa Union && return all(T -> _settled_key(T, seen), Base.uniontypes(K))
-    return isconcretetype(K) && !ismutabletype(K) && all(T -> _settled_key(T, seen), fieldtypes(K))
+    return isconcretetype(K) && !ismutabletype(K) && fieldcount(K) > 0 && all(T -> _settled_key(T, seen), fieldtypes(K))
 end
 @generated _settled(::Type{K}) where {K} = _settled_key(K)
 
@@ -125,21 +126,24 @@ end
 end
 
 # A refilled table can change the keys of another table whose hash or equality reads it, so the passes
-# repeat until none refills a table. Tables that do not settle within one pass per table, or two
-# copied keys of one table that are equal, raise an error instead of losing an entry.
+# repeat until none refills a table. The passes are limited to one more than the number of tables,
+# which settles tables whose keys depend on other tables without a cycle. If the last pass still
+# refills a table, the check raises an error instead of losing an entry: two copied keys of one table
+# are equal, or the keys of tables depend on each other in a cycle that needs more passes.
 function _check_tables!(copies)
     tables = get(copies, _REBUILT_TABLES, nothing)
     tables === nothing && return nothing
     list = tables::Vector{Tuple{Ptr{Cvoid}, Any, Any}}
-    for _ in 0:length(list)
+    passes = length(list) + 1
+    for _ in 1:passes
         refilled = false
         for (function_pointer, table, entries) in list
             refilled |= ccall(function_pointer, Bool, (Any, Any), table, entries)
         end
         refilled || return nothing
     end
-    throw(ArgumentError("a copied Dict cannot hold its copied entries: two of its keys are equal, or " *
-        "refilling it changes the keys of another copied Dict"))
+    throw(ArgumentError("the check of copied Dicts refilled a Dict in all $passes passes that it allows: two " *
+        "copied keys of one Dict are equal, or refilling a copied Dict changes the keys of another"))
 end
 
 # Replace the keys and values of the filled slots in place; Base.isslotfilled reads the slot byte.

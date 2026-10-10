@@ -120,7 +120,7 @@ Standard `Base.RefValue` roots usually get their object pointer during copying. 
 
 Loading PreallocationTools.jl enables an extension for `DiffCache` and `FixedSizeDiffCache`. A cache keeps the workspaces that `get_tmp` allocates in an untyped container, `any_du` or `typed_du`, depending on the PreallocationTools version. Copying the entries of that container needs runtime dispatch. So the copy of each container is a new empty container, and `get_tmp` allocates the workspaces of the copy again on demand.
 
-Each container gets one copy, so caches that share a container, such as a cache and its `reshape`, also share it in the copy. If the copy reaches a container through another reference before it reaches a cache that holds it, the cache gets that copy, with its entries. The extension copies all other fields as the generic copier does, so the pointer rule and custom methods apply to them. The trim tests cover copying a `DiffCache` backed by `Vector{Float64}`.
+Each container gets one copy, so caches that share a container, such as a cache and its `reshape`, also share it in the copy. If the copy reaches a container through another reference before it reaches a cache that holds it, the cache gets that copy, with its entries. The extension copies all other fields as the generic copier does, so the pointer rule, custom methods and the `TypeError` for a copy of another type apply to them. The trim tests cover copying a `DiffCache` backed by `Vector{Float64}`.
 
 `LazyBufferCache` and `GeneralLazyBufferCache` use the generic field copier. Their buffers are in a `Dict{Any, Any}`, so copying them needs runtime dispatch and is not trim-safe.
 
@@ -168,7 +168,7 @@ Concrete types alone do not guarantee a trim build: copy methods must also avoid
 
 In these cases, `Base.deepcopy` crashes or gives a broken copy, and this package does better:
 
-- If a dictionary key holds a reference to the dictionary, the copied dictionary receives the key before the copy sets the key's fields. When the key's hash reads those fields, `Base.deepcopy` reads them unset. On Julia 1.10 to 1.13 and 1.14-DEV, that crashed the process in our tests. Before the copy sets those fields, two different keys can also compare equal, so that one entry replaces the other. This package keeps the copied entries of each `Dict` whose key type can reach a mutable object. After the copy, it refills a table that lost or misplaced an entry. The check looks up each key of such a table once. [test/examples/cyclic_key.jl](test/examples/cyclic_key.jl) shows both results.
+- If a dictionary key holds a reference to the dictionary, the copied dictionary receives the key before the copy sets the key's fields. When the key's hash reads those fields, `Base.deepcopy` reads them unset. On Julia 1.10 to 1.13 and 1.14-DEV, that crashed the process in our tests. Before the copy sets those fields, two different keys can also compare equal, so that one entry replaces the other. This package keeps the copied entries of each `Dict` whose key type can reach a mutable object, also through a raw pointer. After the copy, it refills a table that lost or misplaced an entry. Each pass checks that the table contains every copied key with its copied value. A refill can change the keys of another table, so the check repeats, with at most one pass more than the number of such tables. If the last pass still refills a table, the copy raises `ArgumentError` and drops no entry. Two copied keys of one such table that compare equal cause this error. Tables whose keys depend on each other in a cycle can also need more passes than the limit. [test/examples/cyclic_key.jl](test/examples/cyclic_key.jl) shows both results.
 - From Julia 1.11, `Base.deepcopy` keeps the stale objectids of the original members in the index of the copied `IdSet`, so the copied set does not find most of its members. This package rebuilds the set, so lookups work. On Julia 1.10, both implementations give the same result.
 
 ## Performance
@@ -177,18 +177,18 @@ Run `julia --project bench/deepcopy.jl`. It reports the lowest batch-average tim
 
 | Value | `Base.deepcopy` | `specialized_deepcopy` |
 | --- | --- | --- |
-| Numeric buffers (10 210 numbers in four vectors) | 1.00 µs, 84.7 kB | 0.81 µs, 84.3 kB |
-| Small value (a vector, a struct and a string) | 0.09 µs, 3.7 kB | 0.05 µs, 0.5 kB |
-| 10 000 mutable structs in a vector | 688 µs, 1.70 MB | 153 µs, 0.50 MB |
-| 100 media (nested structs, dicts and Union fields) | 126 µs, 362 kB | 36 µs, 253 kB |
-| Dict of 1 000 vectors, String keys | 121 µs, 391 kB | 76 µs, 301 kB |
-| Dict of 1 000 vectors, Symbol keys | 80 µs, 359 kB | 41 µs, 269 kB |
-| Dict of 1 000 vectors, mutable keys | 134 µs, 391 kB | 88 µs, 360 kB |
-| 1 000 immutable structs holding vectors | 351 µs, 1.08 MB | 121 µs, 761 kB |
-| 10 000 mutable structs in a `Vector{Any}` | 690 µs, 1.70 MB | 262 µs, 594 kB |
-| Linked list of 1 000 nodes | 73 µs, 122 kB | 47 µs, 122 kB |
-| 10 000 `Union{Missing, Float64}` elements | 403 µs, 1.12 MB | 26 µs, 179 kB |
-| 1 000 strings | 67 µs, 210 kB | 33 µs, 123 kB |
+| Numeric buffers (10 210 numbers in four vectors) | 0.98 µs, 84.7 kB | 0.80 µs, 84.3 kB |
+| Small value (a vector, a struct and a string) | 0.09 µs, 3.7 kB | 0.06 µs, 0.5 kB |
+| 10 000 mutable structs in a vector | 658 µs, 1.70 MB | 154 µs, 0.50 MB |
+| 100 media (nested structs, dicts and Union fields) | 126 µs, 375 kB | 37 µs, 253 kB |
+| Dict of 1 000 vectors, String keys | 123 µs, 391 kB | 77 µs, 301 kB |
+| Dict of 1 000 vectors, Symbol keys | 79 µs, 359 kB | 41 µs, 269 kB |
+| Dict of 1 000 vectors, mutable keys | 133 µs, 391 kB | 87 µs, 360 kB |
+| 1 000 immutable structs holding vectors | 352 µs, 1.11 MB | 128 µs, 761 kB |
+| 10 000 mutable structs in a `Vector{Any}` | 675 µs, 1.70 MB | 264 µs, 594 kB |
+| Linked list of 1 000 nodes | 71 µs, 122 kB | 47 µs, 122 kB |
+| 10 000 `Union{Missing, Float64}` elements | 394 µs, 1.12 MB | 25 µs, 179 kB |
+| 1 000 strings | 68 µs, 210 kB | 33 µs, 123 kB |
 
 ## Julia internals
 

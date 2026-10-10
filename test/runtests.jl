@@ -34,6 +34,21 @@ import ..Fuzz, ..FuzzCases
 include(joinpath(dirname(@__DIR__), "scripts", "fuzz_hammer.jl"))
 end
 
+# The stress runner with stand-ins for the fixtures: no generated types, and two explicit cases. The
+# first case reports a failed check. The second keeps what the file LOG holds in SEEN, and then Ctrl-C
+# stops it.
+module StubbedHammerTool
+module Fuzz
+define_types!(rng, n; kwargs...) = DataType[]
+end
+module FuzzCases
+const LOG, SEEN = Ref(""), Ref("")
+cases(_) = [(name = "failed check", run = () -> ["copy: wrong value"]),
+    (name = "stopped", run = () -> (SEEN[] = read(LOG[], String); throw(InterruptException())))]
+end
+include(joinpath(dirname(@__DIR__), "scripts", "fuzz_hammer.jl"))
+end
+
 # A wrong-type override, also reachable through FunctionWrapper.
 mutable struct WrongType
     id::Int
@@ -50,6 +65,14 @@ struct MisfitHolder
 end
 SpecializedDeepcopy.specialized_deepcopy(x::Misfit, copies) = Float64(x.id)
 Base.deepcopy_internal(x::Misfit, ::IdDict) = Float64(x.id)
+
+# A vector whose method returns a Vector{Int}, which still fits a field of type AbstractVector{Int}.
+struct WrongVector <: AbstractVector{Int}
+    values::Vector{Int}
+end
+Base.size(x::WrongVector) = size(x.values)
+Base.getindex(x::WrongVector, i::Int) = x.values[i]
+SpecializedDeepcopy.specialized_deepcopy(x::WrongVector, copies) = copy(x.values)
 
 # Plain values must bypass this override.
 struct PlainId
@@ -196,6 +219,48 @@ struct Pin
     circuit::Circuit
 end
 Base.hash(p::Pin, h::UInt) = hash(objectid(p.circuit.owner), h)
+
+# A key that holds the address of its owner, which a registry keeps alive. Its hash reads a field of
+# the owner, and its copy method copies the owner.
+struct OwnerAddress
+    address::Ptr{Cvoid}
+end
+mutable struct AddressOwner
+    table::Dict{OwnerAddress, Int}
+    storage::Vector{Int}
+end
+const ADDRESS_OWNERS = Dict{Ptr{Cvoid}, AddressOwner}()
+function owner_address(owner::AddressOwner)
+    address = pointer_from_objref(owner)
+    ADDRESS_OWNERS[address] = owner
+    return OwnerAddress(address)
+end
+Base.hash(k::OwnerAddress, h::UInt) = hash(objectid(ADDRESS_OWNERS[k.address].storage), h)
+SpecializedDeepcopy.specialized_deepcopy(k::OwnerAddress, copies) = owner_address(specialized_deepcopy(ADDRESS_OWNERS[k.address], copies))
+
+# Two tables whose keys depend on the copy of a table: two keys of `table` compare equal for a moment
+# of the copy, and the hash of a SizeKey reads the length of its table.
+mutable struct PairKey
+    left::Vector{Int}
+    table::Dict{PairKey, Any}
+    right::Vector{Int}
+end
+Base.hash(k::PairKey, h::UInt) = hash(k.left === k.right, h)
+Base.isequal(a::PairKey, b::PairKey) = (a.left === a.right) == (b.left === b.right)
+struct SizeKey
+    table::Dict{PairKey, Any}
+    id::Int
+end
+Base.hash(k::SizeKey, h::UInt) = hash(length(k.table), hash(k.id, h))
+
+# Keys of two tables whose equality reads the length of the other table, a cycle between the tables.
+mutable struct PeerKey
+    id::Int
+    peer::Any
+end
+peer_class(k::PeerKey) = min(k.id, length(k.peer) + 1)
+Base.hash(k::PeerKey, h::UInt) = hash(peer_class(k), h)
+Base.isequal(a::PeerKey, b::PeerKey) = peer_class(a) == peer_class(b)
 
 # Run code in a fresh Julia process with this test project and capture stdout.
 run_isolated(code, flags = ``) =
@@ -439,6 +504,38 @@ end
             copied = specialized_deepcopy(value)
             @test Fuzz.check(value, copied) === nothing && length(copied[end].table) == 2
         end
+        # A key that holds a raw pointer can lead to objects that the copy sets after the table receives
+        # the key. Each owner reaches its own table first, so the hash of each copied key changes after
+        # the insertion. With eight tables, lookups that work by chance are unlikely.
+        address_owners = [AddressOwner(Dict{OwnerAddress, Int}(), [i]) for i in 1:8]
+        for (i, owner) in pairs(address_owners)
+            owner.table[owner_address(owner)] = i
+        end
+        copied = specialized_deepcopy(address_owners)
+        @test all(pairs(copied)) do (i, owner)
+            key = only(keys(owner.table))
+            ADDRESS_OWNERS[key.address] === owner && get(owner.table, key, 0) == i &&
+                owner.storage == [i] && owner.storage !== address_owners[i].storage
+        end
+        # Refilling `pair_table` changes the hash of the key of `sizes`, so the check needs a second pass.
+        pair_table = Dict{PairKey, Any}()
+        vector = [1]
+        pair_keys = (PairKey(vector, pair_table, vector), PairKey([2], pair_table, [3]))
+        pair_table[pair_keys[1]], pair_table[pair_keys[2]] = 1, 2
+        sizes = Dict(SizeKey(pair_table, 1) => 42)
+        pair_table[pair_keys[1]], pair_table[pair_keys[2]] = sizes, sizes
+        first_key, second_key, copied_table, copied_sizes = specialized_deepcopy((pair_keys..., pair_table, sizes))
+        @test length(copied_table) == 2 && copied_table[first_key] === copied_table[second_key] === copied_sizes
+        @test get(copied_sizes, SizeKey(copied_table, 1), 0) == 42
+        @test first_key.table === copied_table === second_key.table
+        @test first_key.left === first_key.right && second_key.left !== second_key.right
+        # Keys whose equality reads the length of the other table form a cycle between two tables. With
+        # six entries per table, the tables need more passes than the limit of one more than the number
+        # of tables, so the copy raises an error.
+        peers = [Dict(PeerKey(i, zeros(Int, 6)) => i for i in 1:6) for _ in 1:2]
+        foreach(k -> k.peer = peers[2], keys(peers[1]))
+        foreach(k -> k.peer = peers[1], keys(peers[2]))
+        @test_throws "in all 3 passes" specialized_deepcopy(peers)
         # Two copied keys that are equal after the copy cannot both stay: an error, not a lost entry.
         copies = IdDict{Any, Any}()
         SpecializedDeepcopy._check_later!(copies, Dict{Vector{Int}, Int}(), [[1] => 1, [1] => 2])
@@ -446,7 +543,7 @@ end
         # Only a table whose keys can change after the table receives them gets that check.
         settled = (String, Tuple{String, Int}, @NamedTuple{tag::KeyTag, name::String}, Union{Nothing, Symbol}, KeyChain)
         @test all(SpecializedDeepcopy._settled_key, settled)
-        @test !any(SpecializedDeepcopy._settled_key, (Owner, Pin, Tuple{Owner, Int}, Any, Vector{Int}))
+        @test !any(SpecializedDeepcopy._settled_key, (Owner, Pin, Tuple{Owner, Int}, Any, Vector{Int}, OwnerAddress, Union{Nothing, Ptr{Cvoid}}))
     end
 
     @testset "Base types" begin
@@ -745,6 +842,13 @@ end
             @test_throws PointerCopyError(BorrowedVector, :address) specialized_deepcopy(build(DiffCache, borrowed, zeros(2)))
             @test_throws PointerCopyError(BorrowedVector, :address) specialized_deepcopy(build(FixedSizeDiffCache, borrowed, zeros(2)))
             @test specialized_deepcopy(build(DiffCache, shared, zeros(2))).du === shared
+        end
+        # The copy of a data buffer must have the type of the buffer, also when the declared type of
+        # the field is abstract.
+        for C in (DiffCache, FixedSizeDiffCache)
+            T = C{AbstractVector{Int}, Vector{Int}}
+            wrong = fieldcount(T) == 4 ? T(WrongVector([1, 2]), [3, 4], W(), true) : T(WrongVector([1, 2]), [3, 4], W())
+            @test_throws TypeError specialized_deepcopy(wrong)
         end
     end
 
@@ -1502,12 +1606,19 @@ end
         code = "sleep(0.5); print(stdout, \"out\\n\"); flush(stdout); print(stderr, \"err\\n\")"
         wait(HammerTool.launch(`$(Base.julia_cmd()) --startup-file=no -e $code`, log))
         @test readlines(log) == ["out", "err"]
-        # The watchdog stops a worker past its limit, and the driver can collect it.
-        sleeper = HammerTool.launch(`$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"`, tempname())
+        # The watchdog stops a worker past its limit, by force if SIGTERM does not end it, and the
+        # driver can collect it. The sleeper ignores SIGTERM, except on Windows, where kill ends a
+        # process at once. It prints `ready` when it is ready to be stopped.
+        sleeper_log = tempname()
+        sleep_code = "println(\"ready\"); flush(stdout); sleep(600)"
+        sleep_command = Sys.iswindows() ? `$(Base.julia_cmd()) --startup-file=no -e $sleep_code` : `sh -c 'trap "" TERM; echo ready; exec sleep 600'`
+        sleeper = HammerTool.launch(sleep_command, sleeper_log)
+        @test timedwait(() -> occursin("ready", read(sleeper_log, String)), 60) === :ok
         start = time_ns()
-        @test !HammerTool.overdue(start, 60) && HammerTool.overdue(start - UInt64(61 * 10^9), 60)
-        HammerTool.stop!(sleeper)
+        @test !HammerTool.overdue(start, 60) && HammerTool.overdue(start - UInt64(61e9), 60)
+        HammerTool.stop!([sleeper])
         @test process_exited(sleeper) && !success(sleeper)
+        @test Sys.iswindows() || sleeper.termsignal == Base.SIGKILL
         # The checks of a worker for one seed of each family, and for one seed of one family only.
         @test HammerTool.reproduce(1, 1) == 0
         @test HammerTool.reproduce(1, "plain", 3) == 0
@@ -1521,6 +1632,16 @@ end
         @test status == 0 && last(lines) == "DONE round=1 failures=0"
         expected = Dict("plain" => 0, "method" => 0, "trim" => 0, "cases" => length(FuzzCases.cases(Xoshiro(1))))
         @test HammerTool.completed_seeds(lines, "") == expected
+        # The failed check of an explicit case reaches the log of a worker or a replay before the next
+        # case starts, so Ctrl-C in a later case keeps it. The second case reads the log.
+        stub = StubbedHammerTool.FuzzCases
+        first_failure = r"^FAIL round=1 family=cases seed=1 "m
+        stub.LOG[], stub.SEEN[] = tempname(), ""
+        @test_throws InterruptException open(io -> redirect_stdout(() -> StubbedHammerTool.worker(1, 0.0, mktempdir(), UInt(7)), io), stub.LOG[], "w")
+        @test occursin(first_failure, stub.SEEN[])
+        stub.LOG[], stub.SEEN[] = tempname(), ""
+        @test open(io -> redirect_stdout(() -> StubbedHammerTool.reproduce(1, "cases"), io), stub.LOG[], "w") == 1
+        @test occursin(first_failure, stub.SEEN[])
         # Ctrl-C stops the active worker, which is not a crash, and the driver still writes its summary.
         # Rounds count from 1 in each run, and a run leaves the files of an earlier run alone.
         parent = mktempdir()
