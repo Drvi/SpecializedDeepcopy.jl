@@ -166,7 +166,7 @@ Concrete types alone do not guarantee a trim build: copy methods must also avoid
 
 ### Different from Base.deepcopy
 
-In these cases, `Base.deepcopy` crashes or gives a broken copy, and this package does better:
+In these cases, `Base.deepcopy` crashes or gives a broken copy, and this package tries to fix them:
 
 - If a dictionary key holds a reference to the dictionary, the copied dictionary receives the key before the copy sets the key's fields. When the key's hash reads those fields, `Base.deepcopy` reads them unset. On Julia 1.10 to 1.13 and 1.14-DEV, that crashed the process in our tests. Before the copy sets those fields, two different keys can also compare equal, so that one entry replaces the other. This package keeps the copied entries of each `Dict` whose key type can reach a mutable object, also through a raw pointer. After the copy, it refills a table that lost or misplaced an entry. Each pass checks that the table contains every copied key with its copied value. A refill can change the keys of another table, so the check repeats, with at most one pass more than the number of such tables. If the last pass still refills a table, the copy raises `ArgumentError` and drops no entry. Two copied keys of one such table that compare equal cause this error. Tables whose keys depend on each other in a cycle can also need more passes than the limit. [test/examples/cyclic_key.jl](test/examples/cyclic_key.jl) shows both results.
 - From Julia 1.11, `Base.deepcopy` keeps the stale objectids of the original members in the index of the copied `IdSet`, so the copied set does not find most of its members. This package rebuilds the set, so lookups work. On Julia 1.10, both implementations give the same result.
