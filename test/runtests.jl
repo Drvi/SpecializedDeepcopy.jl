@@ -267,11 +267,12 @@ run_isolated(code, flags = ``) =
     read(`$(Base.julia_cmd()) --startup-file=no $flags --project=$(Base.active_project()) -e $code`, String)
 
 # Run code that can fail or crash in a fresh Julia process. Return whether the process succeeded,
-# and its stdout. Its stderr, such as a crash report, is discarded.
+# and its stdout. The stderr of a process that fails, such as a crash report, goes to the test log.
 function run_outcome(code)
-    output = IOBuffer()
+    output, errors = IOBuffer(), IOBuffer()
     command = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $code`
-    finished = success(pipeline(command; stdout = output, stderr = devnull))
+    finished = success(pipeline(command; stdout = output, stderr = errors))
+    finished || print(stderr, String(take!(errors)))
     return finished, String(take!(output))
 end
 
@@ -1349,18 +1350,23 @@ end
         length_of(node) = (n = 0; while node !== nothing; n += 1; node = node.next; end; n)
         @test all(copier -> length_of(copier(chain(1000))) == 1000, copiers)
         # Each overflow runs in a process of its own. After a stack overflow, the state of the process can
-        # be corrupt, and a second overflow can crash it on Windows (see JuliaLang/julia#46870).
+        # be corrupt, and a second overflow can crash it on Windows (see JuliaLang/julia#46870). The
+        # handler is in a function, which Julia compiles: on Windows from Julia 1.13, an overflow that
+        # unwinds to a handler in interpreted top-level code crashes the process.
         for copier in (:specialized_deepcopy, :deepcopy)
             code = """
                 using SpecializedDeepcopy
                 include($(repr(joinpath(@__DIR__, "types.jl"))))
-                long = foldl((next, _) -> Node("node", next), 1:1_000_000; init = nothing)
-                try
-                    $copier(long)
-                    print("copied")
-                catch e
-                    print(nameof(typeof(e)))
+                function overflow(copy, value)
+                    try
+                        copy(value)
+                        return "copied"
+                    catch e
+                        return string(nameof(typeof(e)))
+                    end
                 end
+                long = foldl((next, _) -> Node("node", next), 1:1_000_000; init = nothing)
+                print(overflow($copier, long))
                 flush(stdout)
                 """
             @test run_outcome(code) == (true, "StackOverflowError")
