@@ -1,9 +1,9 @@
 module SpecializedDeepcopy
 
-export specialized_deepcopy, PointerCopyError
+export specialized_deepcopy, specialized_deepcopy_internal, PointerCopyError
 
 """
-    specialized_deepcopy(x)
+    specialized_deepcopy(x[, copies::IdDict{Any,Any}])
 
 Copy `x` using generated code for its concrete type. The target contract is `Base.deepcopy` with
 stricter pointer handling; the current exceptions are described below and in the README.
@@ -11,17 +11,24 @@ stricter pointer handling; the current exceptions are described below and in the
 Concrete fields and elements, or supported small unions, can avoid runtime dispatch. Custom methods
 and inference limits can still prevent compilation with `juliac --trim=safe`.
 
-Copy related values as a tuple to preserve sharing between them:
+`copies` maps originals to their copies. Copy related values as one tuple, or pass the same `copies`
+to several calls, to preserve sharing between them:
 
 ```julia
 weights = [1.0, 2.0]
 a, b = specialized_deepcopy((weights, weights))
 @assert a === b && a !== weights
+
+copies = IdDict{Any,Any}()
+c = specialized_deepcopy(weights, copies)
+d = specialized_deepcopy((weights,), copies)
+@assert d[1] === c
 ```
 
-Call this one-argument method once for all related values. After the copy, it completes each copied
-`Dict` whose keys can change during the copy, and raises `ArgumentError` when it cannot. The
-two-argument method below serves custom methods inside that call.
+After the copy, each call completes the copied `Dict`s of that call whose keys can change during the
+copy, and raises `ArgumentError` when it cannot. If a call throws, `copies` holds unfinished copies, so
+do not pass it to another call. Custom methods copy nested values with
+[`specialized_deepcopy_internal`](@ref), not with this function.
 
 Base copies raw pointer addresses unchanged. Here a raw pointer (`Ptr`, `Cstring`, `Cwstring` or
 `Core.LLVMPtr`) or `WeakRef` raises [`PointerCopyError`](@ref), unless an enclosing type's method
@@ -29,20 +36,31 @@ handles ownership. The FunctionWrappers extension rebuilds the copied callable's
 
 Non-pointer exceptions include rebuilding `IdSet` tables to avoid Base's member-lookup bug from
 Julia 1.11, refilling a copied `Dict` after the copy when the hash or the equality of its keys changed
-during the copy, resetting PreallocationTools workspaces, and the custom-method rules below.
+during the copy, resetting PreallocationTools workspaces, and the custom-method rules of
+[`specialized_deepcopy_internal`](@ref).
+"""
+function specialized_deepcopy(x, copies::IdDict{Any, Any} = IdDict{Any, Any}())
+    y = _copy_value(x, copies)::typeof(x)
+    _check_tables!(copies)
+    return y
+end
 
-    specialized_deepcopy(x, copies::IdDict{Any,Any})
+"""
+    specialized_deepcopy_internal(x, copies::IdDict{Any,Any})
 
-Add a two-argument method for your type. Custom `Base.deepcopy_internal` methods do not apply to
-the generic field copier. `copies` maps originals to copies, some still under construction:
+Copy `x` inside a call of [`specialized_deepcopy`](@ref). Add a method for your type to define its
+copy. Custom `Base.deepcopy_internal` methods do not apply to the generic field copier. `copies` maps
+originals to copies, some still under construction:
 
 1. Return a value of the same type as `x`.
-2. Copy each nested value with `specialized_deepcopy(value, copies)`.
+2. Copy each nested value with `specialized_deepcopy_internal(value, copies)`. Never call
+   `specialized_deepcopy` from `specialized_deepcopy_internal`, you may only call the internal
+   version recursively.
 3. If the type is mutable, return `copies[x]` when `haskey(copies, x)`. Set `copies[x]` to the copy
    before you copy a field that can lead back to `x`.
 
 Do not inspect unfinished copies retrieved from `copies`. A trim-safe method must avoid runtime
-dispatch. A one-argument method changes only top-level calls.
+dispatch.
 
 A plain value is an `isbitstype` value containing no raw pointers; generic copying reuses it without
 calling a custom method. Constructor-optional fields also bypass custom methods when their declared
@@ -55,21 +73,13 @@ For example, explicitly share a lookup table:
 struct LookupTable
     values::Vector{Float64}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::LookupTable, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::LookupTable, copies) = x
 ```
 """
-function specialized_deepcopy end
-
-function specialized_deepcopy(x)
-    copies = IdDict{Any, Any}()
-    y = _copy_value(x, copies)::typeof(x)
-    _check_tables!(copies)
-    return y
-end
-specialized_deepcopy(x, copies) = _copy_by_fields(x, copies)
+specialized_deepcopy_internal(x, copies) = _copy_by_fields(x, copies)
 
 # Generic copy paths bypass customization for pointer-free bits values.
-_copy_value(x::T, copies) where {T} = _plain(T) ? x : specialized_deepcopy(x, copies)
+_copy_value(x::T, copies) where {T} = _plain(T) ? x : specialized_deepcopy_internal(x, copies)
 
 # Bound inference by nested type parameters, not by object traversal depth.
 const MAX_INFERRED_TYPE_DEPTH = 16
@@ -109,8 +119,8 @@ or `WeakRef`. `field` names the raw pointer field, or is `nothing` for a bare po
 A copied pointer does not retain the storage's owner. A field-by-field `WeakRef` copy is not
 registered with the garbage collector. Either can dangle after the original storage is freed.
 
-Add `SpecializedDeepcopy.specialized_deepcopy(x::T, copies)` for the enclosing type to define safe
-ownership, for example by sharing `x` or duplicating its storage.
+Add `SpecializedDeepcopy.specialized_deepcopy_internal(x::T, copies)` for the enclosing type to define
+safe ownership, for example by sharing `x` or duplicating its storage.
 """
 struct PointerCopyError <: Exception
     type::Type
@@ -126,9 +136,9 @@ function Base.showerror(io::IO, e::PointerCopyError)
     end
     print(io, "A copy of it refers to memory that the copy does not keep alive. ")
     if e.field === nothing
-        print(io, "Add a method `SpecializedDeepcopy.specialized_deepcopy(x::T, copies)` for the type T that holds the value.")
+        print(io, "Add a method `SpecializedDeepcopy.specialized_deepcopy_internal(x::T, copies)` for the type T that holds the value.")
     else
-        print(io, "Add a method `SpecializedDeepcopy.specialized_deepcopy(x::T, copies)` that shares or duplicates the value, ",
+        print(io, "Add a method `SpecializedDeepcopy.specialized_deepcopy_internal(x::T, copies)` that shares or duplicates the value, ",
             "with T = ", e.type, " if your code defines that type, or else a type of your own that holds the value.")
     end
 end
@@ -233,7 +243,7 @@ function _copy_by_fields_expr(T::DataType)
         end
     end
     if _has_hidden_contents(T)
-        message = "specialized_deepcopy has no method for $T, whose contents are not fields"
+        message = "specialized_deepcopy_internal has no method for $T, whose contents are not fields"
         return :(throw(ArgumentError($message)))
     end
     ismutabletype(T) && return _mutable_copy_expr(T)

@@ -75,7 +75,7 @@ end
 struct SharedHandle
     address::Ptr{Cvoid}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::SharedHandle, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::SharedHandle, copies) = x
 struct SharedDevice
     handle::SharedHandle
     gain::Float64
@@ -90,7 +90,7 @@ struct SharedVector <: AbstractVector{Float64}
     address::Ptr{Float64}
     n::Int
 end
-SpecializedDeepcopy.specialized_deepcopy(x::SharedVector, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::SharedVector, copies) = x
 Base.size(x::Union{BorrowedVector, SharedVector}) = (x.n,)
 Base.getindex(x::Union{BorrowedVector, SharedVector}, i::Int) = (checkbounds(x, i); unsafe_load(x.address, i))
 
@@ -101,7 +101,7 @@ struct BytesKey
 end
 const KEY_BYTES = Dict{Ptr{UInt8}, Vector{UInt8}}()
 BytesKey(bytes::Vector{UInt8}) = (KEY_BYTES[pointer(bytes)] = bytes; BytesKey(pointer(bytes)))
-SpecializedDeepcopy.specialized_deepcopy(x::BytesKey, copies) =
+SpecializedDeepcopy.specialized_deepcopy_internal(x::BytesKey, copies) =
     get!(() -> BytesKey(copy(KEY_BYTES[x.address])), copies, x)::BytesKey
 
 # Rebuild keys derived from object identity.
@@ -110,15 +110,15 @@ struct OwnerIndex
     slots::Dict{UInt, Int}
 end
 OwnerIndex(owners) = OwnerIndex(owners, Dict(objectid(o) => i for (i, o) in pairs(owners)))
-SpecializedDeepcopy.specialized_deepcopy(x::OwnerIndex, copies) =
-    OwnerIndex(specialized_deepcopy(x.owners, copies))
+SpecializedDeepcopy.specialized_deepcopy_internal(x::OwnerIndex, copies) =
+    OwnerIndex(specialized_deepcopy_internal(x.owners, copies))
 
 # A type assertion makes this abstract field usable under trim.
 struct Registry
     owner::Any
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Registry, copies) =
-    Registry(specialized_deepcopy(x.owner::Owner, copies))
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Registry, copies) =
+    Registry(specialized_deepcopy_internal(x.owner::Owner, copies))
 
 # Two windows must retain one shared Storage in the copy.
 mutable struct Storage
@@ -160,12 +160,12 @@ Base.get(t::AbstractIdentityTable, k, default) = (i = get(t.slots, objectid(k), 
 Base.haskey(t::AbstractIdentityTable, k) = haskey(t.slots, objectid(k))
 Base.length(t::AbstractIdentityTable) = length(t.keys)
 Base.iterate(t::AbstractIdentityTable, i = 1) = i > length(t.keys) ? nothing : (t.keys[i] => t.vals[i], i + 1)
-function SpecializedDeepcopy.specialized_deepcopy(x::RebuiltIdentityTable{K, V}, copies) where {K, V}
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::RebuiltIdentityTable{K, V}, copies) where {K, V}
     haskey(copies, x) && return copies[x]::RebuiltIdentityTable{K, V}
     y = RebuiltIdentityTable{K, V}()
     copies[x] = y
     for (k, v) in x
-        y[specialized_deepcopy(k, copies)] = specialized_deepcopy(v, copies)
+        y[specialized_deepcopy_internal(k, copies)] = specialized_deepcopy_internal(v, copies)
     end
     return y
 end
@@ -182,7 +182,7 @@ mutable struct CText
     end
 end
 CText(s::String) = GC.@preserve s CText(pointer(s))
-SpecializedDeepcopy.specialized_deepcopy(x::CText, copies) =
+SpecializedDeepcopy.specialized_deepcopy_internal(x::CText, copies) =
     haskey(copies, x) ? copies[x]::CText : (copies[x] = CText(x.text))
 
 # ByteView's pointer targets its own array. OwnedByteView redirects it into the copied array.
@@ -194,8 +194,8 @@ struct OwnedByteView
     bytes::Vector{UInt8}
     cursor::Ptr{UInt8}
 end
-function SpecializedDeepcopy.specialized_deepcopy(x::OwnedByteView, copies)
-    bytes = specialized_deepcopy(x.bytes, copies)
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::OwnedByteView, copies)
+    bytes = specialized_deepcopy_internal(x.bytes, copies)
     return OwnedByteView(bytes, pointer(bytes) + (x.cursor - pointer(x.bytes)))
 end
 
@@ -209,7 +209,7 @@ mutable struct NumberedTicket
     number::Int
     NumberedTicket() = new(TICKET_COUNT[] += 1)
 end
-SpecializedDeepcopy.specialized_deepcopy(x::NumberedTicket, copies) =
+SpecializedDeepcopy.specialized_deepcopy_internal(x::NumberedTicket, copies) =
     haskey(copies, x) ? copies[x]::NumberedTicket : (copies[x] = NumberedTicket())
 
 # Explicitly share the IOStream and its C handle.
@@ -217,7 +217,7 @@ struct Logger
     io::IOStream
     level::Int
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Logger, copies) = Logger(x.io, x.level)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Logger, copies) = Logger(x.io, x.level)
 
 # A mutable type without fields: each copy is a new object.
 mutable struct Token end
@@ -340,7 +340,7 @@ ping_chain(n, tail) = foldl((x, i) -> Ping{Pong}(i, Pong(x)), 2:n; init = Ping{P
 struct Tagged
     value::Union{Int, Float64}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Tagged, copies) = Tagged(x.value + 1)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Tagged, copies) = Tagged(x.value + 1)
 struct TaggedHolder
     tag::Tagged
 end
@@ -353,17 +353,17 @@ end
 
 # The override must also apply when the lock belongs to a condition.
 mutable struct SharedLock <: Base.AbstractLock end
-SpecializedDeepcopy.specialized_deepcopy(x::SharedLock, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::SharedLock, copies) = x
 
 # Preserve a condition-lock cycle; Base's lock-copy method would instead call BackLock().
 mutable struct BackLock <: Base.AbstractLock
     condition::Any
 end
-function SpecializedDeepcopy.specialized_deepcopy(x::BackLock, copies)
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::BackLock, copies)
     haskey(copies, x) && return copies[x]::BackLock
     y = BackLock(nothing)
     copies[x] = y
-    y.condition = specialized_deepcopy(x.condition, copies)
+    y.condition = specialized_deepcopy_internal(x.condition, copies)
     return y
 end
 
@@ -389,4 +389,4 @@ end
 struct PointerTable
     addresses::Vector{Ptr{Cvoid}}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::PointerTable, copies) = PointerTable(copy(x.addresses))
+SpecializedDeepcopy.specialized_deepcopy_internal(x::PointerTable, copies) = PointerTable(copy(x.addresses))

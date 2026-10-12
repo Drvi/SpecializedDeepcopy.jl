@@ -5,7 +5,7 @@
 struct Address
     pointer::Ptr{Cvoid}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Address, copies) = Address(C_NULL)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Address, copies) = Address(C_NULL)
 
 # Base and the standard libraries define Base.deepcopy_internal for some of their types. The package
 # copies each of those types as Base.deepcopy does, with a method of its own or by calling Base's.
@@ -33,7 +33,7 @@ SpecializedDeepcopy.specialized_deepcopy(x::Address, copies) = Address(C_NULL)
         using SpecializedDeepcopy
         library(m) = m.module in (Base, Core) || parentmodule(m.module) === Base ||
             (dir = pkgdir(m.module); dir !== nothing && startswith(dir, Sys.STDLIB))
-        generic = which(SpecializedDeepcopy.specialized_deepcopy, Tuple{Any, Any})
+        generic = which(SpecializedDeepcopy.specialized_deepcopy_internal, Tuple{Any, Any})
         # Base's methods for Any and Tuple copy fields, as the generic copy does. A method signature
         # can drop the bounds of the type's parameters, so the type is narrowed to its declaration.
         # Base's method for GenericMemoryRef covers MemoryRef; other kinds of memory are a limit of
@@ -42,7 +42,7 @@ SpecializedDeepcopy.specialized_deepcopy(x::Address, copies) = Address(C_NULL)
             (T === Any || T === Tuple) && return true
             T = typeintersect(T, Base.unwrap_unionall(T).name.wrapper)
             nameof(Base.unwrap_unionall(T)) === :GenericMemoryRef && (T = MemoryRef)
-            return which(SpecializedDeepcopy.specialized_deepcopy, Tuple{T, IdDict{Any, Any}}) !== generic
+            return which(SpecializedDeepcopy.specialized_deepcopy_internal, Tuple{T, IdDict{Any, Any}}) !== generic
         end
         for m in methods(Base.deepcopy_internal)
             library(m) || continue

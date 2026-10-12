@@ -6,7 +6,7 @@ module Fuzz
 
 using FunctionWrappers: FunctionWrapper
 using Random: AbstractRNG
-using SpecializedDeepcopy: SpecializedDeepcopy, specialized_deepcopy
+using SpecializedDeepcopy: SpecializedDeepcopy, specialized_deepcopy, specialized_deepcopy_internal
 
 # Parametric types whose declared field types can be abstract, as in `Holder{Real}(1.0)`.
 mutable struct Holder{T}
@@ -21,13 +21,13 @@ end
 mutable struct Shared
     id::Int
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Shared, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Shared, copies) = x
 struct Rebuilt{T}
     inner::T
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Rebuilt{T}, copies) where {T} = Rebuilt{T}(specialized_deepcopy(x.inner, copies))
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Rebuilt{T}, copies) where {T} = Rebuilt{T}(specialized_deepcopy_internal(x.inner, copies))
 mutable struct FuzzLock <: Base.AbstractLock end
-SpecializedDeepcopy.specialized_deepcopy(x::FuzzLock, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::FuzzLock, copies) = x
 const LOCK = FuzzLock()
 
 # A callable that can refer back to its wrapper, and a plain callable whose override must be skipped.
@@ -39,7 +39,7 @@ struct PlainLaw
     gain::Int
 end
 (law::PlainLaw)(x::Int) = law.gain * x
-SpecializedDeepcopy.specialized_deepcopy(::PlainLaw, copies) = error("a method was called for a plain value")
+SpecializedDeepcopy.specialized_deepcopy_internal(::PlainLaw, copies) = error("a method was called for a plain value")
 
 # Custom Ref conversion reads state that can point back to the wrapper.
 # Other graph roots can make the copy reach this state first.
@@ -60,7 +60,7 @@ struct Bumped
     value::Union{Nothing, Int}
 end
 bumped(x::Bumped) = Bumped(x.value === nothing ? nothing : x.value + 1)
-SpecializedDeepcopy.specialized_deepcopy(x::Bumped, copies) = bumped(x)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Bumped, copies) = bumped(x)
 
 # Dictionary keys with an ID that the copy keeps, so that the checker can pair the entries of a table
 # and its copy without the original keys. The keys of one generated value have distinct IDs.
@@ -72,7 +72,7 @@ const TaggedKey = Tuple{Tag, String}
 const NamedKey = @NamedTuple{tag::Tag, name::String}
 retag(k::TaggedKey) = (k[1], "c" * k[2])
 retag(k::NamedKey) = (tag = k.tag, name = "c" * k.name)
-SpecializedDeepcopy.specialized_deepcopy(k::Union{TaggedKey, NamedKey}, copies) = retag(k)
+SpecializedDeepcopy.specialized_deepcopy_internal(k::Union{TaggedKey, NamedKey}, copies) = retag(k)
 # A key that hashes by identity.
 mutable struct IdentityKey
     const id::Int

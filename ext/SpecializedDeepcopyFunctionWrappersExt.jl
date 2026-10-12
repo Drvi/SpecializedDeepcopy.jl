@@ -12,7 +12,7 @@ using SpecializedDeepcopy: SpecializedDeepcopy, specialized_deepcopy
 # roots or conversions may reach unfinished storage, so defer them until the first call. Setting
 # `ptr` to C_NULL uses FunctionWrappers' reinit_wrapper path, which rebuilds both pointers without
 # synchronization.
-function SpecializedDeepcopy.specialized_deepcopy(x::FunctionWrapper{R, A}, copies) where {R, A}
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::FunctionWrapper{R, A}, copies) where {R, A}
     haskey(copies, x) && return copies[x]::FunctionWrapper{R, A}
     y = ccall(:jl_new_struct_uninit, Any, (Any,), FunctionWrapper{R, A})::FunctionWrapper{R, A}
     copies[x] = y

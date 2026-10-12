@@ -5,29 +5,29 @@ const BaseCopied = Union{
     BigInt, BigFloat, Base.AbstractLock,
 }
 
-specialized_deepcopy(x::BaseCopied, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
+specialized_deepcopy_internal(x::BaseCopied, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
 
 # From Julia 1.14, Base shares cancellation token sources and gives a wait entry, which has storage
 # beyond its fields, a new entry from the runtime. A field copy of a wait entry would lack that storage.
 @static if isdefined(Core, :CancellationTokenSource)
-    specialized_deepcopy(x::Core.CancellationTokenSource, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
+    specialized_deepcopy_internal(x::Core.CancellationTokenSource, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
 end
 @static if isdefined(Core, :WaitEntryN)
-    specialized_deepcopy(x::Core.WaitEntryN, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
+    specialized_deepcopy_internal(x::Core.WaitEntryN, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
 end
 
 # Reset the wait queue and copy the lock. get! preserves a condition copy registered by a cycle
 # through the lock, keeping repeated conditions on one copied queue.
-function specialized_deepcopy(x::Base.GenericCondition, copies)
+function specialized_deepcopy_internal(x::Base.GenericCondition, copies)
     haskey(copies, x) && return copies[x]::typeof(x)
     y = typeof(x)(_copy_value(getfield(x, :lock), copies))
     return get!(copies, x, y)::typeof(x)
 end
 
-specialized_deepcopy(x::Type, copies) = x
+specialized_deepcopy_internal(x::Type, copies) = x
 
 # SimpleVector stores its elements outside its fields.
-function specialized_deepcopy(x::Core.SimpleVector, copies)
+function specialized_deepcopy_internal(x::Core.SimpleVector, copies)
     haskey(copies, x) && return copies[x]::Core.SimpleVector
     y = Core.svec(Any[_copy_value(xi, copies)::typeof(xi) for xi in x]...)
     copies[x] = y
@@ -35,7 +35,7 @@ function specialized_deepcopy(x::Core.SimpleVector, copies)
 end
 
 # Field reconstruction would bypass the garbage collector's WeakRef registration.
-specialized_deepcopy(::WeakRef, copies) = throw(PointerCopyError(WeakRef, nothing))
+specialized_deepcopy_internal(::WeakRef, copies) = throw(PointerCopyError(WeakRef, nothing))
 
 # The copy of a plain, String or Symbol key is equal to the key and hashes the same: a plain value
 # bypasses custom methods, and a method for String or Symbol would be type piracy. So a Dict with
@@ -50,7 +50,7 @@ function _stable_hash(@nospecialize(K))
 end
 @generated _stable(::Type{K}) where {K} = _stable_hash(K)
 
-function specialized_deepcopy(x::D, copies) where {D <: Union{Dict, IdDict}}
+function specialized_deepcopy_internal(x::D, copies) where {D <: Union{Dict, IdDict}}
     haskey(copies, x) && return copies[x]::D
     if _plain(keytype(D)) && _plain(valtype(D))
         y = copy(x)
@@ -140,7 +140,12 @@ function _check_tables!(copies)
         for (function_pointer, table, entries) in list
             refilled |= ccall(function_pointer, Bool, (Any, Any), table, entries)
         end
-        refilled || return nothing
+        if !refilled
+            # A later call with the same `copies` checks only its own tables: a refill of a table from
+            # this call would undo the changes that the caller made to it in between.
+            delete!(copies, _REBUILT_TABLES)
+            return nothing
+        end
     end
     throw(ArgumentError("the check of copied Dicts refilled a Dict in all $passes passes that it allows: two " *
         "copied keys of one Dict are equal, or refilling a copied Dict changes the keys of another"))
@@ -183,7 +188,7 @@ end
 # rebuilds the index. Before 1.11, an IdSet wraps an IdDict, which the generic field copy rebuilds
 # while keeping aliases to it, as Base does.
 @static if !hasfield(Base.IdSet{Any}, :dict)
-    function specialized_deepcopy(x::S, copies) where {S <: Base.IdSet}
+    function specialized_deepcopy_internal(x::S, copies) where {S <: Base.IdSet}
         haskey(copies, x) && return copies[x]::S
         y = S()
         copies[x] = y
@@ -218,7 +223,7 @@ end
     # Since Julia 1.11, Array stores its shape and a MemoryRef in `size` and `ref`. Copying the ref
     # preserves shared backing Memory and offsets. Register the empty array first so elements can
     # refer back to it, as in Base.deepcopy.
-    function specialized_deepcopy(x::Array{T, N}, copies) where {T, N}
+    function specialized_deepcopy_internal(x::Array{T, N}, copies) where {T, N}
         haskey(copies, x) && return copies[x]::Array{T, N}
         y = Array{T, N}(undef, ntuple(_ -> 0, Val(N)))
         copies[x] = y
@@ -227,14 +232,14 @@ end
         return y
     end
 
-    function specialized_deepcopy(x::MemoryRef{T}, copies) where {T}
+    function specialized_deepcopy_internal(x::MemoryRef{T}, copies) where {T}
         ref = memoryref(_copy_value(getfield(x, :mem), copies))
         i = Base.memoryrefoffset(x)
         # The initial reference also represents empty memory, where a bounds-checked move would fail.
         return i == 1 ? ref : Core.memoryrefnew(ref, i, true)
     end
 
-    function specialized_deepcopy(x::Memory{T}, copies) where {T}
+    function specialized_deepcopy_internal(x::Memory{T}, copies) where {T}
         haskey(copies, x) && return copies[x]::Memory{T}
         y = _plain(T) ? copy(x) : Memory{T}(undef, length(x))
         copies[x] = y
@@ -247,7 +252,7 @@ end
     end
 else
     # Julia 1.10: copy each array's buffer separately, matching Base.deepcopy for reshape aliases.
-    function specialized_deepcopy(x::Array{T, N}, copies) where {T, N}
+    function specialized_deepcopy_internal(x::Array{T, N}, copies) where {T, N}
         haskey(copies, x) && return copies[x]::Array{T, N}
         y = _plain(T) ? copy(x) : similar(x)
         copies[x] = y

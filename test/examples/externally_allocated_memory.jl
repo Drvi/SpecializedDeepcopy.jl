@@ -30,7 +30,7 @@ mutable struct ExternBuffer
         return buffer
     end
 end
-function SpecializedDeepcopy.specialized_deepcopy(x::ExternBuffer, copies)
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::ExternBuffer, copies)
     haskey(copies, x) && return copies[x]::ExternBuffer
     y = ExternBuffer(x.length)
     GC.@preserve x y unsafe_copyto!(y.data, x.data, x.length)

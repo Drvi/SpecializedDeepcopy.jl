@@ -1,7 +1,7 @@
 name = "SpecializedDeepcopy"
 uuid = "d9f839d0-568b-4a2d-afd8-98575451154f"
 authors = ["Tomas Drvostep <tomas.drvostep@juliahub.com>"]
-version = "0.1.0"
+version = "0.2.0"
 
 [weakdeps]
 FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"

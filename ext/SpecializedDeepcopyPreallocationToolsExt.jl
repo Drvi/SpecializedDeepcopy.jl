@@ -20,7 +20,7 @@ function _workspace_copy(x::W, copies) where {W}
     return y
 end
 
-@generated function SpecializedDeepcopy.specialized_deepcopy(x::Union{DiffCache, FixedSizeDiffCache}, copies)
+@generated function SpecializedDeepcopy.specialized_deepcopy_internal(x::Union{DiffCache, FixedSizeDiffCache}, copies)
     fields = map(1:fieldcount(x)) do i
         F = fieldtype(x, i)
         v = :(getfield(x, $i))

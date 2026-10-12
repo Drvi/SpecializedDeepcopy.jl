@@ -20,7 +20,7 @@ end
 struct ResultCache
     results::WeakKeyDict{Model, Vector{Float64}}
 end
-function SpecializedDeepcopy.specialized_deepcopy(x::ResultCache, copies)
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::ResultCache, copies)
     results = get!(WeakKeyDict{Model, Vector{Float64}}, copies, x.results)::WeakKeyDict{Model, Vector{Float64}}
     return ResultCache(results)
 end

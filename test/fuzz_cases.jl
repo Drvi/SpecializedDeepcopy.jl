@@ -22,7 +22,7 @@ include(joinpath(@__DIR__, "examples", "wrapped_mutable_callable.jl"))
 struct Address
     pointer::Ptr{Cvoid}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Address, copies) = Address(C_NULL)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Address, copies) = Address(C_NULL)
 
 """
     Case(name, run)

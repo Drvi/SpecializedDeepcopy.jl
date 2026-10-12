@@ -25,7 +25,17 @@ inputs, outputs = specialized_deepcopy((weights, weights))
 @assert inputs === outputs && inputs !== weights
 ```
 
-Call `specialized_deepcopy` with one argument. After the copy, it completes the copied dictionaries whose keys can change during the copy; see [Different from Base.deepcopy](#different-from-basedeepcopy). The two-argument method is for [custom copy methods](#custom-copy-methods), which run inside that call.
+To preserve sharing between values that you cannot put in one tuple, pass the same `IdDict{Any,Any}` to several calls. It maps each original to its copy:
+
+```julia
+weights = [1.0, 2.0]
+copies = IdDict{Any,Any}()
+inputs = specialized_deepcopy(weights, copies)
+outputs = specialized_deepcopy((weights,), copies)
+@assert outputs[1] === inputs
+```
+
+Each call completes the copied dictionaries of that call whose keys can change during the copy; see [Different from Base.deepcopy](#different-from-basedeepcopy). If a call throws, `copies` holds unfinished copies, so do not pass it to another call. [Custom copy methods](#custom-copy-methods) extend `specialized_deepcopy_internal`, which copies the values inside a call.
 
 Do not mutate the input graph during copying.
 
@@ -47,7 +57,7 @@ Copying pointer bits neither copies nor keeps the target alive. A custom method 
 
 The last row applies to fields that a constructor can leave unset, with a concrete, immutable, inline type containing no references or raw pointers. It applies **even when the field is initialized**. Unset bits can contain invalid Union tags, and there is no definedness flag to distinguish them. For a non-plain type `T`, declaring the field as `Union{T, Nothing}` allows its custom method to run.
 
-`specialized_deepcopy` does not call custom `Base.deepcopy_internal` methods of other packages. A type with such a method needs a (two-argument) `specialized_deepcopy` method too. [Custom copy methods](#custom-copy-methods) describes how to write one.
+`specialized_deepcopy` does not call custom `Base.deepcopy_internal` methods of other packages. A type with such a method needs a `specialized_deepcopy_internal` method too. [Custom copy methods](#custom-copy-methods) describes how to write one.
 
 ## Behavior shared with Base.deepcopy
 
@@ -68,12 +78,14 @@ Other identity-based collections may need a method that reinserts copied keys.
 
 ## Custom copy methods
 
-Define `SpecializedDeepcopy.specialized_deepcopy(x::YourType, copies)`. The `copies::IdDict{Any,Any}` argument maps originals to copies, some still under construction.
+Define `SpecializedDeepcopy.specialized_deepcopy_internal(x::YourType, copies)`. The `copies::IdDict{Any,Any}` argument maps originals to copies, some still under construction.
+
+In version 0.1, custom methods extended `specialized_deepcopy` with two arguments. To update such code, rename these methods, and their calls inside custom methods, to `specialized_deepcopy_internal`. Keep the other calls on `specialized_deepcopy`. A method that keeps the old name no longer runs for nested values, and copying a value of its type directly raises a `MethodError`.
 
 Custom `Base.deepcopy_internal` methods of other packages must be ported to this API. Base and the standard libraries need no port: for each of their types with such a method, the package has a method of its own or calls Base's method. For pointers in Base containers, such as `Vector{Ptr{Cvoid}}`, define the method on your enclosing type.
 
 1. Return the same type as `x`.
-2. Use `specialized_deepcopy(value, copies)` for nested values.
+2. Use `specialized_deepcopy_internal(value, copies)` for nested values. Never call `specialized_deepcopy` from `specialized_deepcopy_internal`, you may only call the internal version recursively.
 3. For mutable types, return an existing `copies[x]`, or register the new copy before following a reference that could lead back to `x`.
 4. Do not read fields of an unfinished copy obtained from `copies`.
 
@@ -83,10 +95,8 @@ For example, deliberately share a lookup table:
 struct LookupTable
     values::Vector{Float64}
 end
-SpecializedDeepcopy.specialized_deepcopy(x::LookupTable, copies) = x
+SpecializedDeepcopy.specialized_deepcopy_internal(x::LookupTable, copies) = x
 ```
-
-Use the two-argument method; a one-argument method affects only top-level calls.
 
 Rebuild an index whose keys depend on object identity:
 
@@ -103,8 +113,8 @@ function OwnerIndex(owners)
     return OwnerIndex(owners, slots)
 end
 
-function SpecializedDeepcopy.specialized_deepcopy(x::OwnerIndex, copies)
-    return OwnerIndex(specialized_deepcopy(x.owners, copies))
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::OwnerIndex, copies)
+    return OwnerIndex(specialized_deepcopy_internal(x.owners, copies))
 end
 ```
 
@@ -140,8 +150,8 @@ Abstract fields such as `Any` require runtime dispatch unless a custom method su
 struct Registry
     owner::Any
 end
-function SpecializedDeepcopy.specialized_deepcopy(x::Registry, copies)
-    return Registry(specialized_deepcopy(x.owner::Owner, copies))
+function SpecializedDeepcopy.specialized_deepcopy_internal(x::Registry, copies)
+    return Registry(specialized_deepcopy_internal(x.owner::Owner, copies))
 end
 ```
 

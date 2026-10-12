@@ -53,7 +53,7 @@ end
 mutable struct WrongType
     id::Int
 end
-SpecializedDeepcopy.specialized_deepcopy(x::WrongType, copies) = Float64(x.id)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::WrongType, copies) = Float64(x.id)
 (x::WrongType)(n::Int) = n * x.id
 
 # Wrong-type methods for both copies, at the top level, in a field and in an array.
@@ -63,7 +63,7 @@ end
 struct MisfitHolder
     misfit::Misfit
 end
-SpecializedDeepcopy.specialized_deepcopy(x::Misfit, copies) = Float64(x.id)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::Misfit, copies) = Float64(x.id)
 Base.deepcopy_internal(x::Misfit, ::IdDict) = Float64(x.id)
 
 # A vector whose method returns a Vector{Int}, which still fits a field of type AbstractVector{Int}.
@@ -72,13 +72,13 @@ struct WrongVector <: AbstractVector{Int}
 end
 Base.size(x::WrongVector) = size(x.values)
 Base.getindex(x::WrongVector, i::Int) = x.values[i]
-SpecializedDeepcopy.specialized_deepcopy(x::WrongVector, copies) = copy(x.values)
+SpecializedDeepcopy.specialized_deepcopy_internal(x::WrongVector, copies) = copy(x.values)
 
 # Plain values must bypass this override.
 struct PlainId
     id::Int
 end
-SpecializedDeepcopy.specialized_deepcopy(x::PlainId, copies) = error("a method was called for a plain value")
+SpecializedDeepcopy.specialized_deepcopy_internal(x::PlainId, copies) = error("a method was called for a plain value")
 (x::PlainId)(n::Int) = n * x.id
 
 # Callables that hold another wrapper, as a composed model function can: one stored inline in its Ref,
@@ -155,7 +155,7 @@ end
 const STATIC_ROOTS = [Ref(StaticLaw())]
 Base.cconvert(::Type{Ref{StaticLaw}}, ::StaticLaw) = PlainRoot(1)
 Base.unsafe_convert(::Type{Ref{StaticLaw}}, root::PlainRoot) = Base.unsafe_convert(Ref{StaticLaw}, STATIC_ROOTS[root.slot])
-SpecializedDeepcopy.specialized_deepcopy(::PlainRoot, copies) = error("a method was called for a plain root")
+SpecializedDeepcopy.specialized_deepcopy_internal(::PlainRoot, copies) = error("a method was called for a plain root")
 
 # A callable that overrides conversion of Base.cconvert's Ref.
 struct PtrLaw
@@ -201,8 +201,8 @@ end
 struct KeyTag
     id::Int
 end
-SpecializedDeepcopy.specialized_deepcopy(k::Tuple{KeyTag, String}, copies) = (k[1], "copied-" * k[2])
-SpecializedDeepcopy.specialized_deepcopy(k::@NamedTuple{tag::KeyTag, name::String}, copies) = (tag = k.tag, name = "copied-" * k.name)
+SpecializedDeepcopy.specialized_deepcopy_internal(k::Tuple{KeyTag, String}, copies) = (k[1], "copied-" * k[2])
+SpecializedDeepcopy.specialized_deepcopy_internal(k::@NamedTuple{tag::KeyTag, name::String}, copies) = (tag = k.tag, name = "copied-" * k.name)
 
 # An immutable key type that refers to itself.
 struct KeyChain
@@ -236,7 +236,7 @@ function owner_address(owner::AddressOwner)
     return OwnerAddress(address)
 end
 Base.hash(k::OwnerAddress, h::UInt) = hash(objectid(ADDRESS_OWNERS[k.address].storage), h)
-SpecializedDeepcopy.specialized_deepcopy(k::OwnerAddress, copies) = owner_address(specialized_deepcopy(ADDRESS_OWNERS[k.address], copies))
+SpecializedDeepcopy.specialized_deepcopy_internal(k::OwnerAddress, copies) = owner_address(specialized_deepcopy_internal(ADDRESS_OWNERS[k.address], copies))
 
 # Two tables whose keys depend on the copy of a table: two keys of `table` compare equal for a moment
 # of the copy, and the hash of a SizeKey reads the length of its table.
@@ -312,6 +312,13 @@ end
         push!(group.members, group)
         copied = specialized_deepcopy(group)
         @test copied !== group && only(copied.members) === copied
+
+        # Calls that share `copies` share their copies.
+        copies = IdDict{Any, Any}()
+        inputs = specialized_deepcopy(buffer, copies)
+        outputs = specialized_deepcopy((buffer, [owner]), copies)
+        @test outputs[1] === inputs !== buffer && outputs[2][1] === inputs[1] !== owner
+        @test copies[owner] === inputs[1]
     end
 
     @testset "undefined fields and elements" begin
@@ -539,6 +546,15 @@ end
         foreach(k -> k.peer = peers[2], keys(peers[1]))
         foreach(k -> k.peer = peers[1], keys(peers[2]))
         @test_throws "in all 3 passes" specialized_deepcopy(peers)
+        # A call with your `copies` checks its tables too, and then removes them from `copies`: a later call
+        # does not refill a table of an earlier call, which can have changed in between.
+        copies = IdDict{Any, Any}()
+        copied = specialized_deepcopy(circuit, copies)
+        @test copied.pins[1][Pin(copied)] == 1 && !haskey(copies, SpecializedDeepcopy._REBUILT_TABLES)
+        owners = specialized_deepcopy(Dict(Owner(1.0) => 1), copies)
+        owners[Owner(2.0)] = 2
+        specialized_deepcopy(Dict(Owner(3.0) => 3), copies)
+        @test length(owners) == 2
         # Two copied keys that are equal after the copy cannot both stay: an error, not a lost entry.
         copies = IdDict{Any, Any}()
         SpecializedDeepcopy._check_later!(copies, Dict{Vector{Int}, Int}(), [[1] => 1, [1] => 2])

@@ -7,7 +7,7 @@ using SpecializedDeepcopy: SpecializedDeepcopy
 # A copy of the addresses would not own the buffers, so the generic copy raises PointerCopyError.
 # Base's method gives the copy a new, empty workspace, which allocates its own buffers in a solve.
 @static if isdefined(SparseArrays.CHOLMOD, :CholmodWS)
-    function SpecializedDeepcopy.specialized_deepcopy(x::SparseArrays.CHOLMOD.CholmodWS, copies)
+    function SpecializedDeepcopy.specialized_deepcopy_internal(x::SparseArrays.CHOLMOD.CholmodWS, copies)
         return Base.deepcopy_internal(x, copies)::typeof(x)
     end
 end
