@@ -1,5 +1,7 @@
 # Included by runtests.jl, which defines run_outcome.
 
+using LinearAlgebra: lu
+
 # A SharedArray element type that holds a raw pointer. The copy does not own the target, so the method
 # gives it a null pointer.
 struct Address
@@ -24,7 +26,8 @@ SpecializedDeepcopy.specialized_deepcopy_internal(x::Address, copies) = Address(
         v"1.12" => [common; shared_types; memory],
         v"1.13" => [common; shared_types; memory],
         v"1.14" => [common; memory; "Base: CancellationTokenSource," * chopprefix(shared_types, "Base:");
-            "Base: WaitEntryN"; "SparseArrays.CHOLMOD: CholmodWS"],
+            "Base: WaitEntryN"; "SparseArrays.CHOLMOD: CholmodWS"; "SparseArrays.CHOLMOD: Dense, Factor, Sparse";
+            "SparseArrays.UMFPACK: UmfpackLU"],
     )
     code = """
         for name in readdir(Sys.STDLIB)
@@ -133,6 +136,30 @@ SpecializedDeepcopy.specialized_deepcopy_internal(x::Address, copies) = Address(
             @test SparseArrays.CHOLMOD.free!(copied)
         end
         @test SparseArrays.CHOLMOD.free!(workspace)
+    end
+
+    # CHOLMOD matrices and factorizations and UMFPACK factorizations own C memory through raw pointers.
+    # Where SparseArrays defines Base's method for them, both implementations give a repeated value one
+    # copy with C memory of its own, which works after the original is freed. In older versions,
+    # Base.deepcopy copies the addresses, and this package raises PointerCopyError.
+    matrix = sparse([4.0 1.0; 1.0 3.0])
+    rhs = [1.0, 2.0]
+    owners = ((() -> cholesky(matrix), SparseArrays.CHOLMOD, F -> F \ rhs ≈ matrix \ rhs),
+        (() -> SparseArrays.CHOLMOD.Sparse(matrix), SparseArrays.CHOLMOD, S -> sparse(S) == matrix),
+        (() -> SparseArrays.CHOLMOD.Dense(rhs), SparseArrays.CHOLMOD, D -> vec(Matrix(D)) == rhs),
+        (() -> lu(matrix), SparseArrays.UMFPACK, F -> F \ rhs ≈ matrix \ rhs))
+    for (make, owner, works) in owners
+        if which(Base.deepcopy_internal, Tuple{typeof(make()), IdDict}).module === owner
+            for copier in (specialized_deepcopy, deepcopy)
+                original = make()
+                copied, again = copier((original, original))
+                @test copied === again && copied !== original
+                finalize(original)
+                @test works(copied)
+            end
+        else
+            @test_throws PointerCopyError specialized_deepcopy(make())
+        end
     end
 
     # A SharedArray gets a new shared segment, also when several references reach it.

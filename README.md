@@ -140,6 +140,8 @@ Loading SharedArrays enables an extension that copies a `SharedArray` with Base'
 
 Loading SparseArrays enables an extension for the CHOLMOD solve workspace, which SparseArrays defines from Julia 1.14. The workspace owns C buffers through raw pointers. Base's method makes the copy, a new, empty workspace that allocates its own buffers in a solve.
 
+CHOLMOD matrices and factorizations and UMFPACK factorizations also own C memory through raw pointers. From the SparseArrays of Julia 1.14, SparseArrays defines Base's method for them, and the extension calls it. The copy then gets C memory of its own. With an older SparseArrays, this package raises `PointerCopyError` for these types, and `Base.deepcopy` copies their addresses, which dangle after the original is freed.
+
 ## Trimmed programs
 
 The generated path targets concrete field and element types. It also splits unions of concrete types and tuples with union elements, up to **16 concrete alternatives**. For example, `Tuple{Int, Union{Missing, Float64}}` has two alternatives. Captured variables in a closure follow the same rules as fields.
