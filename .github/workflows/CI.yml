@@ -7,12 +7,14 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} on ${{ matrix.os }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
-    # Nightly checks are advisory.
-    continue-on-error: ${{ matrix.version == 'nightly' }}
+    # Checks on nightly builds of unreleased Julia versions are advisory.
+    continue-on-error: ${{ endsWith(matrix.version, 'nightly') }}
     strategy:
       fail-fast: false
       matrix:
-        version: ["1.10", "1.11", "1.12", "1.13", "nightly"]
+        # `1.14-nightly` is the nightly build of the release branch of Julia 1.14, which has no release
+        # yet. `nightly` builds the master branch.
+        version: ["1.10", "1.11", "1.12", "1.13", "1.14-nightly", "nightly"]
         os: [ubuntu-latest, macos-latest, windows-latest]
         # `default` is the architecture of the runner. Because arch is a matrix value, the 32-bit
         # entries below add jobs instead of changing the 64-bit ones.

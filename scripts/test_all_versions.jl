@@ -3,7 +3,8 @@
 # Logs go to scripts/logs/tests_<channel>.log; failures print in full.
 # Exit 1 if any channel fails, including nightly.
 
-const CHANNELS = ["1.10", "1.11", "1.12", "1.13", "nightly"]
+# `1.14-nightly` is the nightly build of the release branch of Julia 1.14, which has no release yet.
+const CHANNELS = ["1.10", "1.11", "1.12", "1.13", "1.14-nightly", "nightly"]
 const REPO = dirname(@__DIR__)
 const LOGS = mkpath(joinpath(@__DIR__, "logs"))
 

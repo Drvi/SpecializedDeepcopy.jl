@@ -20,14 +20,16 @@ SpecializedDeepcopy.specialized_deepcopy_internal(x::Address, copies) = Address(
         "Base: Tuple", "SharedArrays: SharedArray"]
     shared_types = "Base: DataType, GlobalRef, Method, MethodInstance, Regex, Symbol, Task, Union, UnionAll"
     memory = ["Base: GenericMemory", "Base: GenericMemoryRef"]
+    from_1_14 = [common; memory; "Base: CancellationTokenSource," * chopprefix(shared_types, "Base:");
+        "Base: WaitEntryN"; "SparseArrays.CHOLMOD: CholmodWS"; "SparseArrays.CHOLMOD: Dense, Factor, Sparse";
+        "SparseArrays.UMFPACK: UmfpackLU"]
     expected = Dict(
         v"1.10" => [common; shared_types],
         v"1.11" => [common; shared_types; memory],
         v"1.12" => [common; shared_types; memory],
         v"1.13" => [common; shared_types; memory],
-        v"1.14" => [common; memory; "Base: CancellationTokenSource," * chopprefix(shared_types, "Base:");
-            "Base: WaitEntryN"; "SparseArrays.CHOLMOD: CholmodWS"; "SparseArrays.CHOLMOD: Dense, Factor, Sparse";
-            "SparseArrays.UMFPACK: UmfpackLU"],
+        v"1.14" => from_1_14,
+        v"1.15" => from_1_14,
     )
     code = """
         for name in readdir(Sys.STDLIB)

@@ -1,6 +1,7 @@
 name: Nightly
-# Julia nightly changes every day, so test against it daily. Unlike the nightly jobs of CI.yml, which
-# run only for changes to this repository and are advisory, a failure here fails the run.
+# The nightly builds of Julia's master branch and of the release branch of Julia 1.14 change every
+# day, so test against them daily. Unlike the same jobs of CI.yml, which run only for changes to this
+# repository and are advisory, a failure here fails the run.
 on:
   schedule:
     # 03:23 UTC: GitHub can delay or drop scheduled runs at the start of an hour, when its load peaks.
@@ -8,17 +9,18 @@ on:
   workflow_dispatch:
 jobs:
   test:
-    name: Julia nightly on ${{ matrix.os }}
+    name: Julia ${{ matrix.version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        version: ["1.14-nightly", "nightly"]
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
         with:
-          version: nightly
+          version: ${{ matrix.version }}
       - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
