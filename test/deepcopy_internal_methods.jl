@@ -20,9 +20,13 @@ SpecializedDeepcopy.specialized_deepcopy_internal(x::Address, copies) = Address(
         "Base: Tuple", "SharedArrays: SharedArray"]
     shared_types = "Base: DataType, GlobalRef, Method, MethodInstance, Regex, Symbol, Task, Union, UnionAll"
     memory = ["Base: GenericMemory", "Base: GenericMemoryRef"]
-    from_1_14 = [common; memory; "Base: CancellationTokenSource," * chopprefix(shared_types, "Base:");
-        "Base: WaitEntryN"; "SparseArrays.CHOLMOD: CholmodWS"; "SparseArrays.CHOLMOD: Dense, Factor, Sparse";
-        "SparseArrays.UMFPACK: UmfpackLU"]
+    # Julia 1.15 and early builds of 1.14 define cancellation token sources and wait entries. The release
+    # branch of 1.14 does not (JuliaLang/julia#64651). The package's methods for them use the same checks.
+    cancellation = isdefined(Core, :CancellationTokenSource) ?
+        "Base: CancellationTokenSource," * chopprefix(shared_types, "Base:") : shared_types
+    wait_entries = isdefined(Core, :WaitEntryN) ? ["Base: WaitEntryN"] : String[]
+    from_1_14 = [common; memory; cancellation; wait_entries; "SparseArrays.CHOLMOD: CholmodWS";
+        "SparseArrays.CHOLMOD: Dense, Factor, Sparse"; "SparseArrays.UMFPACK: UmfpackLU"]
     expected = Dict(
         v"1.10" => [common; shared_types],
         v"1.11" => [common; shared_types; memory],

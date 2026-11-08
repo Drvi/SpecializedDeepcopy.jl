@@ -7,8 +7,9 @@ const BaseCopied = Union{
 
 specialized_deepcopy_internal(x::BaseCopied, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
 
-# From Julia 1.14, Base shares cancellation token sources and gives a wait entry, which has storage
-# beyond its fields, a new entry from the runtime. A field copy of a wait entry would lack that storage.
+# Where Core defines them, as in Julia 1.15, Base shares cancellation token sources and gives a wait
+# entry, which has storage beyond its fields, a new entry from the runtime. A field copy of a wait entry
+# would lack that storage.
 @static if isdefined(Core, :CancellationTokenSource)
     specialized_deepcopy_internal(x::Core.CancellationTokenSource, copies) = Base.deepcopy_internal(x, copies)::typeof(x)
 end
