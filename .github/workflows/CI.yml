@@ -30,9 +30,14 @@ jobs:
             arch: x86
     steps:
       - uses: actions/checkout@v7
-      # JuliaC links 32-bit programs with `gcc -m32`, which needs the 32-bit C runtime.
+      # JuliaC links 32-bit programs with `gcc -m32`, which needs the 32-bit C runtime. gcc-multilib
+      # also installs x32 libraries. The launcher of 32-bit Julia 1.13 and later takes libstdc++ only
+      # from the x32 entries of the linker cache, and cannot load it. JULIA_PROBE_LIBSTDCXX=0 makes
+      # Julia load the libstdc++ that it bundles.
       - if: matrix.arch == 'x86' && runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-multilib
+          echo "JULIA_PROBE_LIBSTDCXX=0" >> "$GITHUB_ENV"
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
