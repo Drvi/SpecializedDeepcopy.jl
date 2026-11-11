@@ -174,7 +174,7 @@ Concrete types alone do not guarantee a trim build: copy methods must also avoid
 - A custom method that returns a value of the wrong type raises `TypeError`, at the top level and inside fields and arrays.
 - Copying a module raises `ErrorException`.
 - Each copied `SharedArray` gets a new segment of its own. A `reshape` of a `SharedArray`, and its `sdata` array, use the segment of the original, but their copies do not use the segment of the copy.
-- From Julia 1.11, neither implementation can copy a `GenericMemory` other than `Memory`, such as `AtomicMemory`. This package raises `PointerCopyError`, which names the `ptr` field and asks for a method. `Base.deepcopy` raises `TypeError: in new, expected DataType`.
+- From Julia 1.11, neither implementation can copy a `GenericMemory` other than `Memory`, such as `AtomicMemory`. This package raises `PointerCopyError`, which names the `ptr` field and asks for a method. `Base.deepcopy` raises `TypeError: in new, expected DataType`. From Julia 1.15, it raises `ErrorException: GenericMemory has hidden fields and can only be allocated by the runtime`.
 
 ### Different from Base.deepcopy
 

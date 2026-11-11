@@ -1407,11 +1407,13 @@ end
             @test backing[1] == 0.0 && shaped[1] == 0.0
         end
         # From Julia 1.11, neither implementation copies a GenericMemory other than Memory. This
-        # package raises a PointerCopyError that names the field, and Base.deepcopy a TypeError.
+        # package raises a PointerCopyError that names the field. Base.deepcopy raises a TypeError,
+        # or an ErrorException where Base marks the types that only the runtime can allocate, as
+        # in Julia 1.15.
         @static if isdefined(Base, :AtomicMemory)
             atomic = Base.AtomicMemory{Int}(undef, 2)
             @test_throws PointerCopyError(Base.AtomicMemory{Int}, :ptr) specialized_deepcopy(atomic)
-            @test_throws TypeError deepcopy(atomic)
+            @test_throws (isdefined(Base, :datatype_hashiddenfields) ? ErrorException : TypeError) deepcopy(atomic)
             message = sprint(showerror, PointerCopyError(Base.AtomicMemory{Int}, :ptr))
             @test occursin("`ptr`", message) && occursin("Add a method", message)
         end
