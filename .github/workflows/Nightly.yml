@@ -1,7 +1,6 @@
 name: Nightly
-# The nightly builds of Julia's master branch and of the release branch of Julia 1.14 change every
-# day, so test against them daily. Unlike the same jobs of CI.yml, which run only for changes to this
-# repository and are advisory, a failure here fails the run.
+# A new Julia prerelease can appear on any day, and CI.yml tests `pre` only for changes to this
+# repository, so test the newest prerelease daily.
 on:
   schedule:
     # 03:23 UTC: GitHub can delay or drop scheduled runs at the start of an hour, when its load peaks.
@@ -14,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["1.14-nightly", "nightly"]
+        version: ["pre"]
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7

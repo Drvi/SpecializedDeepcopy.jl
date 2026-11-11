@@ -1,10 +1,11 @@
 # Run tests concurrently on CHANNELS, installing missing juliaup channels.
 # Usage: julia scripts/test_all_versions.jl
 # Logs go to scripts/logs/tests_<channel>.log; failures print in full.
-# Exit 1 if any channel fails, including nightly.
+# Exit 1 if any channel fails.
 
-# `1.14-nightly` is the nightly build of the release branch of Julia 1.14, which has no release yet.
-const CHANNELS = ["1.10", "1.11", "1.12", "1.13", "1.14-nightly", "nightly"]
+# `alpha` is the newest Julia version, including alphas, betas and release candidates. Without a
+# newer prerelease, it is the latest release.
+const CHANNELS = ["1.10", "1.11", "1.12", "1.13", "alpha"]
 const REPO = dirname(@__DIR__)
 const LOGS = mkpath(joinpath(@__DIR__, "logs"))
 

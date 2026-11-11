@@ -214,19 +214,19 @@ julia --project -e 'import Pkg; Pkg.test()'
 
 On Julia 1.12+, the suite also builds and runs a trimmed executable. Each trim shape compiles separately so shared compiled code cannot hide an inference failure.
 
-Released Julia versions also run Aqua on the package and JET on the package and extension copy methods. The main suite checks ambiguities with extensions loaded; Aqua's isolated ambiguity check loads only the package. QA uses a separate process and environment in `test/qa/Project.toml`. Nightly skips QA because JET does not support prereleases.
+Released Julia versions also run Aqua on the package and JET on the package and extension copy methods. The main suite checks ambiguities with extensions loaded; Aqua's isolated ambiguity check loads only the package. QA uses a separate process and environment in `test/qa/Project.toml`. Prereleases skip QA because JET does not support them.
 
 The suite also lists the `Base.deepcopy_internal` methods of Base and of every standard library of the running Julia version. The list must match the expected list for that version, and the package must handle each type in it. A Julia version without an expected list fails this check.
 
 The suite also runs a seeded fuzzer, [test/fuzz.jl](test/fuzz.jl), and explicit cases, [test/fuzz_cases.jl](test/fuzz_cases.jl). For long runs, see the headers of [scripts/fuzz_hammer.jl](scripts/fuzz_hammer.jl) and [scripts/fuzz_trim.jl](scripts/fuzz_trim.jl).
 
-To run the suite on Julia 1.10 through nightly at once, with juliaup installed:
+To run the suite on Julia 1.10 through the newest prerelease at once, with juliaup installed:
 
 ```sh
 julia scripts/test_all_versions.jl
 ```
 
-Each run uses a temporary environment and writes `scripts/logs/tests_<channel>.log`. Any failed channel, including nightly, makes the script fail.
+Each run uses a temporary environment and writes `scripts/logs/tests_<channel>.log`. Any failed channel makes the script fail.
 
 ## License
 
